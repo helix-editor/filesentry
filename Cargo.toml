@@ -2,7 +2,7 @@
 name = "filesentry"
 description = "robust (recursive) file watcher"
 authors = ["Pascal Kuthe <pascal.kuthe@pm.me>"]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.82.0"
 license = "MPL-2.0"

@@ -319,3 +319,74 @@ impl<T: AsRef<OsStr>> PartialEq<T> for CanonicalPathBuf {
         self.as_os_str() == other.as_ref()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_parent_of_basic() {
+        let foo = CanonicalPathBuf::assert_canonicalized(Path::new("/foo"));
+        let foo_bar = CanonicalPathBuf::assert_canonicalized(Path::new("/foo/bar"));
+        let foo_baz = CanonicalPathBuf::assert_canonicalized(Path::new("/foo/baz"));
+        let foobar = CanonicalPathBuf::assert_canonicalized(Path::new("/foobar"));
+        
+        // /foo is parent of /foo/bar
+        assert!(foo.is_parent_of(&foo_bar));
+        // /foo is parent of /foo/baz  
+        assert!(foo.is_parent_of(&foo_baz));
+        // /foo is NOT parent of /foobar (no separator)
+        assert!(!foo.is_parent_of(&foobar));
+    }
+
+    #[test]
+    fn is_parent_of_same_path() {
+        let foo = CanonicalPathBuf::assert_canonicalized(Path::new("/foo"));
+        let foo2 = CanonicalPathBuf::assert_canonicalized(Path::new("/foo"));
+        
+        // /foo is NOT parent of /foo (same path)
+        assert!(!foo.is_parent_of(&foo2));
+    }
+
+    #[test]
+    fn is_parent_of_longer_self() {
+        let foo_bar = CanonicalPathBuf::assert_canonicalized(Path::new("/foo/bar"));
+        let foo = CanonicalPathBuf::assert_canonicalized(Path::new("/foo"));
+        
+        // /foo/bar is NOT parent of /foo (self is longer)
+        assert!(!foo_bar.is_parent_of(&foo));
+    }
+
+    #[test]
+    fn is_parent_of_nested() {
+        let foo = CanonicalPathBuf::assert_canonicalized(Path::new("/foo"));
+        let foo_bar = CanonicalPathBuf::assert_canonicalized(Path::new("/foo/bar"));
+        let foo_bar_baz = CanonicalPathBuf::assert_canonicalized(Path::new("/foo/bar/baz"));
+        
+        // /foo is parent of /foo/bar/baz
+        assert!(foo.is_parent_of(&foo_bar_baz));
+        // /foo/bar is parent of /foo/bar/baz
+        assert!(foo_bar.is_parent_of(&foo_bar_baz));
+    }
+
+    #[test]
+    fn is_parent_of_null_terminator_safety() {
+        // This test verifies that the null terminator on Unix prevents OOB access
+        // when self.len() == other.as_bytes().len()
+        let foo = CanonicalPathBuf::assert_canonicalized(Path::new("/foo"));
+
+        // On Unix: foo.bytes = [/, f, o, o, \0]
+        // foo.len() = 4 (excluding null)
+        // foo.as_bytes() = [/, f, o, o] (excluding null)
+        // When checking if /foo is_parent_of /foo:
+        // - other.as_bytes().starts_with(self.as_bytes()) = true
+        // - other.bytes[self.len()] = other.bytes[4] = \0 != '/'
+        // So we don't panic, we just return false
+
+        if cfg!(unix) {
+            assert_eq!(foo.buf.as_slice().last(), Some(&0u8)); // null terminated
+            assert_eq!(foo.buf.len(), 5); // includes null
+            assert_eq!(foo.len(), 4); // excludes null
+        }
+    }
+}

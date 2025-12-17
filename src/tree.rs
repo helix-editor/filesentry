@@ -115,6 +115,10 @@ impl NodeId {
         self != Self::NONE
     }
 
+    pub fn is_none(self) -> bool {
+        self == Self::NONE
+    }
+
     pub fn idx(self) -> usize {
         debug_assert_ne!(self, Self::NONE);
         self.0 as usize
@@ -309,10 +313,9 @@ impl FileTree {
                 });
                 let Some(parent) = parent else {
                     log::error!("for {change:?} the parent wasn't yet in the tree! Ignoring...");
+                    // remove inserted entry again as insertion failed
                     self.path_table
-                        .find_entry(hash, |&tree_id| {
-                            self.nodes[tree_id.idx()].path == change.path
-                        })
+                        .find_entry(hash, |&tree_id| tree_id == id)
                         .unwrap()
                         .remove();
                     return (NodeId::NONE, true);
@@ -388,8 +391,10 @@ impl FileTree {
                     self.add_child(parent, id);
                 } else if !root {
                     log::error!("for {path:?} the parent wasn't yet in the tree! Ignoring...");
+                    // Use id comparison instead of accessing self.nodes since the node
+                    // hasn't been added yet (would cause index out of bounds)
                     self.path_table
-                        .find_entry(hash, |&tree_id| self.nodes[tree_id.idx()].path == path)
+                        .find_entry(hash, |&tree_id| tree_id == id)
                         .unwrap()
                         .remove();
                     return None;
@@ -496,6 +501,11 @@ impl FileTree {
             let change = PendingChange { path, flags };
             let (node, _) = self.apply_change(&change, work_stack, &mut emit_event);
 
+            // apply_change can return NodeId::NONE if the path doesn't exist
+            // (e.g., deleted between walkdir iteration and stat)
+            if node.is_none() {
+                continue;
+            }
             self[node].unset_maybe_deleted_flag();
             while work_stack
                 .last()
