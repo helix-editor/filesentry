@@ -98,3 +98,11 @@ impl Deref for Events {
         &self.events
     }
 }
+
+impl From<Vec<Event>> for Events {
+    fn from(events: Vec<Event>) -> Self {
+        Self {
+            events: events.into(),
+        }
+    }
+}

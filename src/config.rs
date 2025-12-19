@@ -1,17 +1,23 @@
 use std::path::Path;
+#[cfg(not(watcher_disable))]
 use std::sync::Arc;
+#[cfg(not(watcher_disable))]
 use std::time::Duration;
 
+#[cfg(not(watcher_disable))]
 use crate::events::Events;
 
+#[cfg(not(watcher_disable))]
 pub type Handler = Box<dyn FnMut(Events) -> bool + Send>;
 
+#[cfg(not(watcher_disable))]
 pub struct Config {
     pub(crate) filter: Arc<dyn Filter>,
     pub(crate) settle_time: Duration,
     pub(crate) handlers: Vec<Handler>,
 }
 
+#[cfg(not(watcher_disable))]
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")

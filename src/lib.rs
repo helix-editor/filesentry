@@ -1,48 +1,64 @@
 use std::io;
 use std::path::Path;
-#[cfg(test)]
+#[cfg(all(test, not(watcher_disable)))]
 use std::sync::atomic::AtomicUsize;
+#[cfg(not(watcher_disable))]
 use std::sync::atomic::{self, AtomicBool};
+#[cfg(not(watcher_disable))]
 use std::sync::{Arc, Mutex, Weak};
+#[cfg(not(watcher_disable))]
 use std::time::Duration;
 
+#[cfg(not(watcher_disable))]
 use crate::config::Config;
+#[cfg(not(watcher_disable))]
 use crate::events::EventDebouncer;
 pub use crate::events::{Event, EventType, Events};
+#[cfg(not(watcher_disable))]
 use crate::inotify::InotifyWatcher;
 pub use crate::path::{CannonicalPath, CanonicalPathBuf};
-use crate::worker::Worker;
 pub use config::Filter;
 
 mod config;
 mod events;
-mod inotify;
 mod metadata;
 mod path;
+
+// These modules require the full Watcher implementation
+#[cfg(not(watcher_disable))]
+mod inotify;
+#[cfg(not(watcher_disable))]
 mod pending;
-#[cfg(test)]
-mod tests;
+#[cfg(not(watcher_disable))]
 mod tree;
+#[cfg(not(watcher_disable))]
 mod worker;
 
+#[cfg(all(test, not(watcher_disable)))]
+mod tests;
+
+#[cfg(not(watcher_disable))]
 struct AddRoot {
     path: CanonicalPathBuf,
     recursive: bool,
     notify: Box<dyn FnOnce(bool) + Send>,
 }
 
+#[cfg(not(watcher_disable))]
 #[derive(Default)]
 struct Notifications {
     /// new roots to be added to the watcher
     roots: Vec<AddRoot>,
 }
 
+#[cfg(not(watcher_disable))]
 impl std::fmt::Debug for Notifications {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Notifications").finish_non_exhaustive()
     }
 }
 
+#[cfg(not(watcher_disable))]
 #[derive(Debug)]
 struct WatcherState {
     config: Mutex<Config>,
@@ -52,16 +68,19 @@ struct WatcherState {
     recrawls: AtomicUsize,
 }
 
+#[cfg(not(watcher_disable))]
 pub struct ShutdownOnDrop {
     watcher: Weak<InotifyWatcher>,
 }
 
+#[cfg(not(watcher_disable))]
 impl ShutdownOnDrop {
     pub fn cancel(&mut self) {
         self.watcher = Weak::new()
     }
 }
 
+#[cfg(not(watcher_disable))]
 impl Drop for ShutdownOnDrop {
     fn drop(&mut self) {
         if let Some(watcher) = self.watcher.upgrade() {
@@ -70,12 +89,23 @@ impl Drop for ShutdownOnDrop {
     }
 }
 
+/// Stub ShutdownOnDrop when watcher is disabled
+#[cfg(watcher_disable)]
+pub struct ShutdownOnDrop;
+
+#[cfg(watcher_disable)]
+impl ShutdownOnDrop {
+    pub fn cancel(&mut self) {}
+}
+
+#[cfg(not(watcher_disable))]
 #[derive(Debug, Clone)]
 pub struct Watcher {
     state: Arc<WatcherState>,
     notify: Arc<InotifyWatcher>,
 }
 
+#[cfg(not(watcher_disable))]
 impl Watcher {
     #[cfg(test)]
     pub fn recrawls(&self) -> usize {
@@ -180,8 +210,48 @@ impl Watcher {
     pub fn start(&self) {
         let watcher = self.clone();
         std::thread::spawn(move || {
-            let worker = Worker::new(watcher);
+            let worker = worker::Worker::new(watcher);
             worker.run();
         });
     }
+}
+
+/// Stub Watcher when file watching is disabled.
+/// File watching is not supported on this platform or has been disabled.
+#[cfg(watcher_disable)]
+#[derive(Debug, Clone)]
+pub struct Watcher;
+
+#[cfg(watcher_disable)]
+impl Watcher {
+    /// Creates a new Watcher. Returns an error when file watching is disabled.
+    pub fn new() -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file watching is disabled or not supported on this platform",
+        ))
+    }
+
+    pub fn shutdown(&self) {}
+
+    pub fn shutdown_guard(&self) -> ShutdownOnDrop {
+        ShutdownOnDrop
+    }
+
+    pub fn add_root(
+        &self,
+        _root: &Path,
+        _recursive: bool,
+        _root_crawled: impl FnOnce(bool) + 'static + Send,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    pub fn set_filter(&self, _filter: std::sync::Arc<dyn Filter>, _recrawl: bool) {}
+
+    pub fn set_settle_time(&self, _settle_time: std::time::Duration) {}
+
+    pub fn add_handler(&self, _handler: impl FnMut(Events) -> bool + Send + 'static) {}
+
+    pub fn start(&self) {}
 }

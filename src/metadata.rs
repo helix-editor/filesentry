@@ -1,6 +1,5 @@
 use std::time::SystemTime;
 
-#[cfg(unix)]
 use crate::path::CannonicalPath;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -42,5 +41,10 @@ impl Metadata {
             size: stat.st_size as usize,
             inode: stat.st_ino,
         })
+    }
+
+    #[cfg(windows)]
+    pub fn for_path(_path: &CannonicalPath) -> Option<Metadata> {
+        unimplemented!("Windows file metadata not yet implemented")
     }
 }

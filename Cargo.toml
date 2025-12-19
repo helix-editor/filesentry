@@ -10,19 +10,22 @@ repository = "https://github.com/helix-editor/filesentry"
 readme = "README.md"
 
 [dependencies]
-bitflags = "2.9.0"
-papaya = "0.2.1"
-walkdir = "2.3.3"
-hashbrown = "0.15.4"
-mio = {version="1.0.4", features = ["os-ext"]}
 ecow = "0.2.5"
 memchr = "2.7.5"
 log = "0.4.27"
-ignore = "0.4.23"
+hashbrown = "0.15.4"
+walkdir = "2.3.3"
 
+# Unix-only (metadata module uses rustix for lstat)
+[target.'cfg(unix)'.dependencies]
 rustix = { version = "1.0.7", features = ["fs"] }
 
-# libc = "0.2.173"
+# Linux-only (inotify module)
+[target.'cfg(target_os = "linux")'.dependencies]
+bitflags = "2.9.0"
+papaya = "0.2.1"
+mio = { version = "1.0.4", features = ["os-ext"] }
+ignore = "0.4.23"
 
 
 [dev-dependencies]
