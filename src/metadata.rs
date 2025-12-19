@@ -29,7 +29,12 @@ impl Metadata {
             }
         };
 
-        let mtime = Duration::new(stat.st_mtime as u64, stat.st_mtime_nsec as u32);
+        let mtime = if stat.st_mtime >= 0 {
+            SystemTime::UNIX_EPOCH + Duration::new(stat.st_mtime as u64, stat.st_mtime_nsec as u32)
+        } else {
+            SystemTime::UNIX_EPOCH
+                - Duration::new((-stat.st_mtime) as u64, stat.st_mtime_nsec as u32)
+        };
         let is_dir = match FileType::from_raw_mode(stat.st_mode) {
             FileType::RegularFile => false,
             FileType::Directory => true,
@@ -37,7 +42,7 @@ impl Metadata {
         };
         Some(Metadata {
             is_dir,
-            mtime: SystemTime::UNIX_EPOCH + mtime,
+            mtime,
             size: stat.st_size as usize,
             inode: stat.st_ino,
         })

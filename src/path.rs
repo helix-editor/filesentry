@@ -99,7 +99,8 @@ impl CannonicalPath {
     }
 
     pub fn is_parent_of(&self, other: &CannonicalPath) -> bool {
-        other.as_bytes().starts_with(self.as_bytes()) && other.bytes[self.len()] == PATH_SEPARATOR
+        other.as_bytes().starts_with(self.as_bytes())
+            && other.bytes.get(self.len()) == Some(&PATH_SEPARATOR)
     }
 }
 
