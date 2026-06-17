@@ -146,10 +146,19 @@ fn cmp(lhs: &[u8], rhs: &[u8]) -> Ordering {
     // we use some unsafe
     let lhs_ = unsafe { slice::from_raw_parts(lhs.as_ptr(), prefix_len) };
     let rhs_ = unsafe { slice::from_raw_parts(rhs.as_ptr(), prefix_len) };
+    // When one path is a prefix of the other, the next byte in the longer path
+    // decides the order. If that byte is the separator the shorter path is an
+    // ancestor directory, so it sorts first. Returning Equal there would make
+    // a directory compare equal to every descendant, which is intransitive and
+    // panics sort_unstable.
     lhs_.cmp(rhs_).then_with(|| match diff.cmp(&0) {
-        Ordering::Less => PATH_SEPARATOR.cmp(unsafe { rhs.get_unchecked(prefix_len) }),
+        Ordering::Less => PATH_SEPARATOR
+            .cmp(unsafe { rhs.get_unchecked(prefix_len) })
+            .then(Ordering::Less),
         Ordering::Equal => Ordering::Equal,
-        Ordering::Greater => unsafe { lhs.get_unchecked(prefix_len) }.cmp(&PATH_SEPARATOR),
+        Ordering::Greater => unsafe { lhs.get_unchecked(prefix_len) }
+            .cmp(&PATH_SEPARATOR)
+            .then(Ordering::Greater),
     })
 }
 
@@ -324,6 +333,38 @@ impl<T: AsRef<OsStr>> PartialEq<T> for CanonicalPathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A directory and its descendants must order consistently. The comparator
+    // used to return Equal for a path versus its own child, which makes Ord
+    // intransitive and panics sort_unstable on large change sets.
+    #[test]
+    fn ord_is_total_across_dir_and_children() {
+        let p = |s| CanonicalPathBuf::assert_canonicalized(Path::new(s));
+        let dir = p("/foo");
+        let child_a = p("/foo/bar");
+        let child_b = p("/foo/baz");
+
+        // A parent sorts strictly before its descendants, never Equal.
+        assert_eq!(dir.cmp(&child_a), Ordering::Less);
+        assert_eq!(dir.cmp(&child_b), Ordering::Less);
+        // Siblings keep their byte order.
+        assert_eq!(child_a.cmp(&child_b), Ordering::Less);
+        // Transitivity holds: dir < child_a < child_b.
+        assert!(dir < child_a && child_a < child_b && dir < child_b);
+
+        // Sorting a mixed tree must not collapse distinct paths or panic.
+        let mut paths = [
+            p("/foo/baz"),
+            p("/foo"),
+            p("/foo/bar"),
+            p("/foo.txt"),
+            p("/foo/bar/deep"),
+            p("/bar"),
+            p("/foo/baz/x"),
+        ];
+        paths.sort_unstable();
+        assert!(paths.windows(2).all(|w| w[0] < w[1]));
+    }
 
     #[test]
     fn is_parent_of_basic() {
