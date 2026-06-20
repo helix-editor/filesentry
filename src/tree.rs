@@ -1,7 +1,6 @@
 use std::hash::{BuildHasher, Hash};
 use std::mem::replace;
 use std::ops::{Index, IndexMut};
-use std::slice;
 use std::time::SystemTime;
 
 use bitflags::bitflags;
@@ -63,19 +62,6 @@ impl NodeMeta {
             (NodeMeta::File { .. }, NodeMeta::Deleted | NodeMeta::Dir) => Some(EventType::Delete),
             _ => None,
         }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct TreeIter<'a> {
-    iter: slice::Iter<'a, FsNode>,
-}
-
-impl<'a> Iterator for TreeIter<'a> {
-    type Item = &'a CanonicalPathBuf;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next().map(|it| &it.path)
     }
 }
 
