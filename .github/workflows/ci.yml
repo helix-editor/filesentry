@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Report every OS independently instead of cancelling the matrix on the
+      # first failure -- the macOS (FSEvents) and Windows (ReadDirectoryChangesW)
+      # backends are newer than the Linux (inotify) one and this is their first
+      # CI coverage.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --all-targets
+      - name: Clippy
+        run: cargo clippy --all-targets
+      - name: Test
+        run: cargo test
+
+  # AddressSanitizer run — this is what actually covers the unsafe FFI in the
+  # FSEvents (macOS) and inotify (Linux) backends, e.g. the FSEvents callback's
+  # `info` lifetime exercised by `teardown_with_pending_events_is_safe`.
+  sanitizer:
+    name: asan ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: Test under AddressSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          RUSTDOCFLAGS: -Zsanitizer=address
+        # queue_overflow intentionally overruns the inotify queue (Linux-only,
+        # timing-dependent); skip it so this run is purely about memory safety.
+        run: cargo +nightly test -Z build-std --target ${{ matrix.target }} -- --skip queue_overflow
