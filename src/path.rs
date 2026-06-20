@@ -1,11 +1,10 @@
 use std::cmp::Ordering;
-use std::ffi::{CStr, OsStr};
+use std::ffi::OsStr;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::mem::transmute;
 use std::ops::Deref;
 use std::path::Path;
-use std::slice;
 
 #[cfg(unix)]
 const PATH_SEPARATOR: u8 = b'/';
@@ -93,9 +92,9 @@ impl CannonicalPath {
     }
 
     #[cfg(unix)]
-    pub fn as_c_str(&self) -> &CStr {
+    pub fn as_c_str(&self) -> &std::ffi::CStr {
         // safety: type is always null terminated by construction
-        unsafe { CStr::from_bytes_with_nul_unchecked(self.as_raw_bytes()) }
+        unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(self.as_raw_bytes()) }
     }
 
     pub fn is_parent_of(&self, other: &CannonicalPath) -> bool {
@@ -127,31 +126,45 @@ impl Ord for CanonicalPathBuf {
     }
 }
 
+/// Total order over canonical paths that also yields "tree order": a directory
+/// sorts immediately before its descendants, and a path's descendants sort
+/// before siblings that share its prefix. Ranking the path separator below every
+/// other byte (and end-of-path below the separator, so a parent sorts first)
+/// makes this a plain lexicographic compare over an injective rank — a provable
+/// total order, unlike the hand-rolled comparator it replaced.
 fn cmp(lhs: &[u8], rhs: &[u8]) -> Ordering {
-    // Since the length of a slice is always less than or equal to
-    // isize::MAX, this never underflows.
-    let diff = lhs.len() as isize - rhs.len() as isize;
-    // This comparison gets optimized away (on x86_64 and ARM) because the
-    // subtraction updates flags.
-    let mut prefix_len = if lhs.len() < rhs.len() {
-        lhs.len()
-    } else {
-        rhs.len()
-    };
-    // strip null terminator
-    if cfg!(unix) {
-        prefix_len = prefix_len.saturating_sub(1);
+    let lhs = strip_nul(lhs);
+    let rhs = strip_nul(rhs);
+    let common = lhs.len().min(rhs.len());
+    for i in 0..common {
+        if lhs[i] != rhs[i] {
+            return rank(lhs[i]).cmp(&rank(rhs[i]));
+        }
     }
-    // for some reason llvm fails to emit these bounds checks and since we need fast sorting
-    // we use some unsafe
-    let lhs_ = unsafe { slice::from_raw_parts(lhs.as_ptr(), prefix_len) };
-    let rhs_ = unsafe { slice::from_raw_parts(rhs.as_ptr(), prefix_len) };
-    lhs_.cmp(rhs_).then_with(|| match diff.cmp(&0) {
-        Ordering::Less => PATH_SEPARATOR.cmp(unsafe { rhs.get_unchecked(prefix_len) }),
-        Ordering::Equal => Ordering::Equal,
-        Ordering::Greater => unsafe { lhs.get_unchecked(prefix_len) }.cmp(&PATH_SEPARATOR),
-    })
+    // Shared prefix is equal; the shorter path (the prefix/parent) sorts first.
+    lhs.len().cmp(&rhs.len())
 }
+
+/// Rank a byte so the path separator sorts before every other byte.
+#[inline]
+fn rank(byte: u8) -> u16 {
+    if byte == PATH_SEPARATOR {
+        0
+    } else {
+        byte as u16 + 1
+    }
+}
+
+/// Strip the trailing NUL terminator that `CanonicalPathBuf` keeps on unix.
+#[inline]
+fn strip_nul(buf: &[u8]) -> &[u8] {
+    if cfg!(unix) && buf.last() == Some(&0) {
+        &buf[..buf.len() - 1]
+    } else {
+        buf
+    }
+}
+
 
 impl CanonicalPathBuf {
     pub fn new() -> CanonicalPathBuf {
@@ -389,5 +402,68 @@ mod tests {
             assert_eq!(foo.buf.len(), 5); // includes null
             assert_eq!(foo.len(), 4); // excludes null
         }
+    }
+
+    fn p(s: &str) -> CanonicalPathBuf {
+        CanonicalPathBuf::assert_canonicalized(Path::new(s))
+    }
+
+    #[test]
+    fn tree_order() {
+        assert!(p("/foo") < p("/foo/bar")); // parent before child
+        assert!(p("/foo") < p("/foobar")); // prefix before longer sibling
+        assert!(p("/foo/bar") < p("/foo/baz")); // siblings by name
+        assert!(p("/foo/a") < p("/foo-x")); // child of foo before sibling foo-x
+        assert!(p("/foo/bar") < p("/foobar")); // descendant before prefix-sibling
+    }
+
+    #[test]
+    fn total_order_axioms() {
+        // The directory/descendant/sibling mix that broke the old comparator
+        // (parent == each child, but children not equal to each other).
+        let set: Vec<_> = [
+            "/foo", "/foo/a", "/foo/b", "/foo/a/x", "/foo-x", "/foobar", "/bar",
+            "/bar/baz", "/a", "/a/b/c", "/foo/a/y", "/foo/aa",
+        ]
+        .into_iter()
+        .map(p)
+        .collect();
+
+        for a in &set {
+            // reflexive + antisymmetric
+            assert_eq!(a.cmp(a), Ordering::Equal);
+            for b in &set {
+                assert_eq!(a.cmp(b), b.cmp(a).reverse(), "antisymmetry {a:?} {b:?}");
+                for c in &set {
+                    // transitivity of <=
+                    if a.cmp(b) != Ordering::Greater && b.cmp(c) != Ordering::Greater {
+                        assert_ne!(a.cmp(c), Ordering::Greater, "transitivity {a:?} {b:?} {c:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sort_large_tree_does_not_panic() {
+        // Reproduces the field panic: sorting a tree with a directory and many
+        // descendants made the old non-transitive comparator trip the standard
+        // sort's total-order check ("the len is N but the index is 4294967295").
+        let mut paths: Vec<CanonicalPathBuf> = Vec::new();
+        for d in 0..120 {
+            paths.push(p(&format!("/repo/dir{d:03}")));
+            for f in 0..120 {
+                paths.push(p(&format!("/repo/dir{d:03}/file{f:03}.rs")));
+            }
+        }
+        // shuffle-ish so the input isn't already ordered
+        paths.reverse();
+        paths.sort_unstable_by(|a, b| a.cmp(b));
+        // parents precede their descendants after sorting
+        let repo = p("/repo/dir000");
+        let child = p("/repo/dir000/file000.rs");
+        let i = paths.iter().position(|x| *x == repo).unwrap();
+        let j = paths.iter().position(|x| *x == child).unwrap();
+        assert!(i < j);
     }
 }
