@@ -93,9 +93,16 @@ impl DirId {
         self != Self::NONE
     }
 
+    #[inline]
     pub fn idx(self) -> usize {
-        debug_assert_ne!(self, Self::NONE);
-        (self.0) as usize
+        // A `debug_assert` let `NONE` (u32::MAX) reach `self.dirs[..]` in release,
+        // a baffling OOB far from the cause. Fail at the source; callers guard with
+        // `is_some()` first.
+        assert!(
+            self.is_some(),
+            "filesentry bug: DirId::NONE used as a tree index"
+        );
+        self.0 as usize
     }
 }
 impl From<usize> for DirId {
@@ -119,8 +126,13 @@ impl NodeId {
         self == Self::NONE
     }
 
+    #[inline]
     pub fn idx(self) -> usize {
-        debug_assert_ne!(self, Self::NONE);
+        // As `DirId::idx`: guard `NONE` in release too, not just under `debug_assert`.
+        assert!(
+            self.is_some(),
+            "filesentry bug: NodeId::NONE used as a tree index"
+        );
         self.0 as usize
     }
 }
@@ -608,5 +620,28 @@ impl Index<DirId> for FileTree {
 impl IndexMut<DirId> for FileTree {
     fn index_mut(&mut self, index: DirId) -> &mut Self::Output {
         &mut self.dirs[index.idx()]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DirId, NodeId};
+
+    #[test]
+    #[should_panic(expected = "NodeId::NONE used as a tree index")]
+    fn node_none_index_panics_clearly() {
+        let _ = NodeId::NONE.idx();
+    }
+
+    #[test]
+    #[should_panic(expected = "DirId::NONE used as a tree index")]
+    fn dir_none_index_panics_clearly() {
+        let _ = DirId::NONE.idx();
+    }
+
+    #[test]
+    fn valid_ids_index_normally() {
+        assert_eq!(NodeId::from(7usize).idx(), 7);
+        assert_eq!(DirId::from(3usize).idx(), 3);
     }
 }
