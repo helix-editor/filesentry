@@ -165,7 +165,6 @@ fn strip_nul(buf: &[u8]) -> &[u8] {
     }
 }
 
-
 impl CanonicalPathBuf {
     pub fn new() -> CanonicalPathBuf {
         Self { buf: EcoVec::new() }
@@ -422,8 +421,8 @@ mod tests {
         // The directory/descendant/sibling mix that broke the old comparator
         // (parent == each child, but children not equal to each other).
         let set: Vec<_> = [
-            "/foo", "/foo/a", "/foo/b", "/foo/a/x", "/foo-x", "/foobar", "/bar",
-            "/bar/baz", "/a", "/a/b/c", "/foo/a/y", "/foo/aa",
+            "/foo", "/foo/a", "/foo/b", "/foo/a/x", "/foo-x", "/foobar", "/bar", "/bar/baz", "/a",
+            "/a/b/c", "/foo/a/y", "/foo/aa",
         ]
         .into_iter()
         .map(p)
@@ -437,7 +436,11 @@ mod tests {
                 for c in &set {
                     // transitivity of <=
                     if a.cmp(b) != Ordering::Greater && b.cmp(c) != Ordering::Greater {
-                        assert_ne!(a.cmp(c), Ordering::Greater, "transitivity {a:?} {b:?} {c:?}");
+                        assert_ne!(
+                            a.cmp(c),
+                            Ordering::Greater,
+                            "transitivity {a:?} {b:?} {c:?}"
+                        );
                     }
                 }
             }

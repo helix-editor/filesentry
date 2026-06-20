@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 #[cfg(not(watcher_disable))]
+use crate::backend::{Backend, NativeBackend};
+#[cfg(not(watcher_disable))]
 use crate::config::Config;
 #[cfg(not(watcher_disable))]
 use crate::events::EventDebouncer;
@@ -33,6 +35,8 @@ mod inotify;
 mod pending;
 #[cfg(not(watcher_disable))]
 mod tree;
+#[cfg(all(not(watcher_disable), target_os = "windows"))]
+mod windows;
 #[cfg(not(watcher_disable))]
 mod worker;
 

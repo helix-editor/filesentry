@@ -84,11 +84,10 @@ impl Worker {
                 if root.recursive {
                     // for recursive roots remove any roots that are children
                     // and not ignored to avoid duplicate crawls
-                    let mut end = i
-                        + self.roots[i..]
-                            .iter()
-                            .position(|&(it, _)| !root.path.is_parent_of(&self.tree[it].path))
-                            .unwrap_or(self.roots.len() - i);
+                    let mut end = i + self.roots[i..]
+                        .iter()
+                        .position(|&(it, _)| !root.path.is_parent_of(&self.tree[it].path))
+                        .unwrap_or(self.roots.len() - i);
                     let mut j = i;
                     while j < end {
                         if filter.ignore_path_rec(
