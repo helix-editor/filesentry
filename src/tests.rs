@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 
-use crate::events::EventType;
+use crate::events::{EventDebouncer, EventType};
+use crate::path::CanonicalPathBuf;
 use crate::Watcher;
 
 static TIMEOUT: LazyLock<Duration> =
@@ -27,10 +28,13 @@ pub static READ_DELAY: LazyLock<Duration> =
         _ => Duration::from_millis(300),
     });
 
+/// Asserts the *net* effect of a change rather than the raw event stream.
+///
+/// A loaded runner may deliver those records to the handler in different batches instead of pre-coalesced.
 struct Assertion {
     done: mpsc::Receiver<()>,
-    state: Arc<Mutex<Vec<(PathBuf, EventType)>>>,
-    expected: Vec<(PathBuf, EventType)>,
+    events: Arc<Mutex<EventDebouncer>>,
+    expected: Vec<(CanonicalPathBuf, EventType)>,
 }
 
 impl Assertion {
@@ -39,32 +43,32 @@ impl Assertion {
         dir: &Path,
         expected: impl IntoIterator<Item = (&'a str, EventType)>,
     ) -> Assertion {
-        let mut expected: Vec<_> = expected
+        let expected: Vec<_> = expected
             .into_iter()
-            .map(|(path, event)| (sub(dir, path), event))
+            .map(|(path, ty)| (CanonicalPathBuf::assert_canonicalized(&sub(dir, path)), ty))
             .collect();
-        expected.sort_unstable();
-        let state: Arc<Mutex<_>> = Arc::default();
+        let events = Arc::new(Mutex::new(EventDebouncer::new()));
         let (tx, rx) = mpsc::sync_channel(1);
-
-        let len = expected.len();
         let assertion = Assertion {
             done: rx,
-            state: state.clone(),
-            expected,
+            events: events.clone(),
+            expected: expected.clone(),
         };
 
-        watcher.add_handler(move |events| {
-            if Arc::strong_count(&state) == 1 {
+        watcher.add_handler(move |batch| {
+            if Arc::strong_count(&events) == 1 {
                 return false;
             }
-            let mut state = state.lock().unwrap();
-            state.extend(
-                events
-                    .iter()
-                    .map(|event| (event.path.as_std_path().to_owned(), event.ty)),
-            );
-            if state.len() >= len {
+            let mut events = events.lock().unwrap();
+            for event in batch.iter() {
+                events.add(event.path.clone(), event.ty);
+            }
+            // Stop once every expected change is present with its expected type.
+            // Unrelated extras (e.g. a parent directory's own `Delete`) are ignored.
+            if expected
+                .iter()
+                .all(|(path, ty)| events.get(path) == Some(*ty))
+            {
                 let _ = tx.send(());
                 false
             } else {
@@ -76,14 +80,20 @@ impl Assertion {
 
     #[track_caller]
     pub fn check(self) {
-        let timeout = self.done.recv_timeout(*TIMEOUT).is_err();
-        self.state.clear_poison();
-        let mut state = self.state.lock().unwrap();
-        state.sort_unstable();
-        if timeout {
-            panic!("watcher didn't observer all changes within the timeout")
-        } else {
-            assert_eq!(&*state, &*self.expected)
+        let timed_out = self.done.recv_timeout(*TIMEOUT).is_err();
+        self.events.clear_poison();
+        let events = self.events.lock().unwrap();
+        for (path, ty) in &self.expected {
+            assert_eq!(
+                events.get(path),
+                Some(*ty),
+                "{}event for {path}",
+                if timed_out {
+                    "timed out waiting for "
+                } else {
+                    "wrong "
+                }
+            );
         }
     }
 }
@@ -139,12 +149,13 @@ fn init_watcher_imp(slow: bool) -> (TempDir, Watcher) {
 // a symlink to `/private/var/...`).
 fn with_watcher(f: impl FnOnce(&Path, &Watcher)) {
     let (dir, watcher) = init_watcher();
-    // Linux's inotify reports a file's create+write (or delete+recreate) in one read,
-    // so the debouncer coalesces them within a single settle window. Windows'
-    // ReadDirectoryChangesW can split those records across separate reads, and a
-    // loaded runner can flush the first before the second arrives -- surfacing a
-    // spurious extra event (e.g. a `Create` *and* a `Modified` for the same file).
-    // Widen the window there so related records reliably land together.
+    // Linux's inotify reports a file's create+write (or delete+recreate) in one
+    // read, so the debouncer coalesces them within a single settle window.
+    // Windows' ReadDirectoryChangesW can split those records across separate
+    // reads, and a loaded runner can flush the first before the second arrives,
+    // so they reach the handler in separate batches. `Assertion` re-coalesces to
+    // handle that; widening the settle window here just reduces how often it
+    // happens (fewer batches), it isn't load-bearing for correctness.
     #[cfg(windows)]
     watcher.set_settle_time(std::time::Duration::from_secs(1));
     let shutdown_guard = watcher.shutdown_guard();

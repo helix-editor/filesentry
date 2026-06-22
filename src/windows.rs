@@ -25,11 +25,11 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, OPEN_EXISTING,
 };
+use windows_sys::Win32::System::Threading::CreateEventW;
 use windows_sys::Win32::System::IO::{
     CancelIoEx, CreateIoCompletionPort, GetOverlappedResult, GetQueuedCompletionStatus,
     PostQueuedCompletionStatus, OVERLAPPED,
 };
-use windows_sys::Win32::System::Threading::CreateEventW;
 
 use crate::backend::Backend;
 use crate::path::CanonicalPathBuf;

@@ -90,6 +90,16 @@ impl EventDebouncer {
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
+
+    /// The coalesced event currently held for `path`, if any.
+    #[cfg(test)]
+    pub(crate) fn get(&self, path: &CanonicalPathBuf) -> Option<EventType> {
+        self.table
+            .find(self.hasher.hash_one(path), |&i| {
+                self.events[i as usize].path == *path
+            })
+            .map(|&i| self.events[i as usize].ty)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

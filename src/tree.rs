@@ -719,7 +719,11 @@ mod tests {
             |_| {},
         );
 
-        assert_eq!(events.len(), 1, "expected only the inner file delete, got {events:?}");
+        assert_eq!(
+            events.len(),
+            1,
+            "expected only the inner file delete, got {events:?}"
+        );
         assert_eq!(events[0].1, EventType::Delete);
         assert!(
             events[0].0.as_std_path().ends_with("baz"),

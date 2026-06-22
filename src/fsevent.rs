@@ -164,7 +164,8 @@ impl FsEventWatcher {
             let mut since_when = self.last_event_id.load(atomic::Ordering::Relaxed);
             if since_when == 0 {
                 since_when = FSEventsGetCurrentEventId();
-                self.last_event_id.store(since_when, atomic::Ordering::Relaxed);
+                self.last_event_id
+                    .store(since_when, atomic::Ordering::Relaxed);
             }
             // The stream owns this heap `CallbackInfo` and frees it via
             // `release_callback` only after the last callback, so an in-flight
