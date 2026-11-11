@@ -1,20 +1,16 @@
 //! macOS FSEvents backend.
 //!
-//! The FSEvents C API and `dispatch` are declared inline (stable system ABIs),
-//! so the crate only needs `core-foundation-sys` for the CF collection/string types.
-//!
-//! One `FSEventStream` over all roots, delivered on a serial `dispatch` queue (no
-//! CFRunLoop thread). Without `kFSEventStreamCreateFlagFileEvents` events are
-//! directory-granular: each one queues a crawl of the reported directory.
-//! `MustScanSubDirs` (coalescing/overflow) maps to a full recrawl, like inotify's
-//! `QUEUE_OVERFLOW`. FSEvents fixes the path list at creation, so a new root
-//! rebuilds the stream, resuming from `last_event_id`.
+//! One `FSEventStream` per root, created when the root is added and never
+//! rebuilt, all delivered on one serial `dispatch` queue (no CFRunLoop thread).
+//! Events are directory-granular (no `FileEvents` flag): each queues a crawl of the
+//! reported directory, and `MustScanSubDirs`/dropped events map to a full recrawl.
+//! The FSEvents C API and `dispatch` are declared inline (stable system ABIs).
 
-use std::ffi::{c_void, CStr};
+use std::ffi::{c_char, c_void, CStr, OsStr};
 use std::os::unix::ffi::OsStrExt;
-use std::sync::atomic::{self, AtomicBool, AtomicU64};
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::path::Path;
+use std::sync::atomic::{self, AtomicBool};
+use std::sync::{Arc, Mutex};
 use std::{io, ptr};
 
 use core_foundation_sys::array::{kCFTypeArrayCallBacks, CFArrayCreate, CFArrayRef};
@@ -33,6 +29,7 @@ type FSEventStreamEventFlags = u32;
 type FSEventStreamEventId = u64;
 type CFTimeInterval = f64;
 type CFIndex = isize;
+type Boolean = u8;
 
 #[repr(C)]
 struct FSEventStreamContext {
@@ -52,9 +49,16 @@ type FSEventStreamCallback = extern "C" fn(
     event_ids: *const FSEventStreamEventId,
 );
 
+const K_FS_EVENT_STREAM_EVENT_ID_SINCE_NOW: FSEventStreamEventId = u64::MAX;
 const K_FS_EVENT_STREAM_CREATE_FLAG_NO_DEFER: u32 = 0x0000_0002;
 const K_FS_EVENT_STREAM_CREATE_FLAG_WATCH_ROOT: u32 = 0x0000_0004;
 const K_FS_EVENT_STREAM_EVENT_FLAG_MUST_SCAN_SUBDIRS: u32 = 0x0000_0001;
+const K_FS_EVENT_STREAM_EVENT_FLAG_USER_DROPPED: u32 = 0x0000_0002;
+const K_FS_EVENT_STREAM_EVENT_FLAG_KERNEL_DROPPED: u32 = 0x0000_0004;
+/// Any of these means events were coalesced or lost and the subtree must be rescanned.
+const RESCAN_FLAGS: u32 = K_FS_EVENT_STREAM_EVENT_FLAG_MUST_SCAN_SUBDIRS
+    | K_FS_EVENT_STREAM_EVENT_FLAG_USER_DROPPED
+    | K_FS_EVENT_STREAM_EVENT_FLAG_KERNEL_DROPPED;
 
 #[link(name = "CoreServices", kind = "framework")]
 unsafe extern "C" {
@@ -68,44 +72,133 @@ unsafe extern "C" {
         flags: FSEventStreamEventFlags,
     ) -> FSEventStreamRef;
     fn FSEventStreamSetDispatchQueue(stream: FSEventStreamRef, q: *mut c_void);
-    fn FSEventStreamStart(stream: FSEventStreamRef) -> bool;
+    fn FSEventStreamStart(stream: FSEventStreamRef) -> Boolean;
     fn FSEventStreamStop(stream: FSEventStreamRef);
     fn FSEventStreamInvalidate(stream: FSEventStreamRef);
     fn FSEventStreamRelease(stream: FSEventStreamRef);
-    /// The newest event id the system has issued. Used to anchor "now" when first
-    /// building a stream so a later rebuild can resume from a concrete id even if
-    /// no event has arrived yet.
-    fn FSEventsGetCurrentEventId() -> FSEventStreamEventId;
 }
 
 // --- libdispatch FFI ---------------------------------------------------------
 #[link(name = "System", kind = "dylib")]
 unsafe extern "C" {
-    fn dispatch_queue_create(label: *const i8, attr: *const c_void) -> *mut c_void;
+    fn dispatch_queue_create(label: *const c_char, attr: *const c_void) -> *mut c_void;
     fn dispatch_release(object: *mut c_void);
+    fn dispatch_sync_f(queue: *mut c_void, context: *mut c_void, work: extern "C" fn(*mut c_void));
 }
 // -----------------------------------------------------------------------------
 
-struct Inner {
-    roots: Vec<CanonicalPathBuf>,
-    stream: FSEventStreamRef, // null when no roots are watched yet
+/// Heap payload handed to the FSEvents callback via the stream context's `info`.
+/// Holds `Arc` clones rather than the watcher, which would be a reference cycle.
+struct CallbackInfo {
+    state: Arc<WatcherState>,
+    changes: Arc<PendingChangesLock>,
+}
+
+/// An `FSEventStream` that is running on the watcher's dispatch queue.
+struct Stream {
+    stream: FSEventStreamRef,
+    /// The serial queue the stream delivers on. It outlives every `Stream` (see
+    /// `Drop for FsEventWatcher`).
+    queue: *mut c_void,
+    /// `FSEventStreamStop` is only valid on a started stream.
+    started: bool,
+}
+
+// SAFETY: FSEventStream references are thread-safe, and the queue pointer is only
+// used for `dispatch_sync_f`, which is too.
+unsafe impl Send for Stream {}
+
+extern "C" fn noop(_: *mut c_void) {}
+
+impl Stream {
+    /// Create and start a stream for `path`, delivering events from now on.
+    fn start(path: &CanonicalPathBuf, queue: *mut c_void, info: CallbackInfo) -> io::Result<Self> {
+        // SAFETY: `path` is a valid byte slice; a null result is handled.
+        let paths = unsafe { cf_path_array(path) };
+        if paths.is_null() {
+            return Err(io::Error::other(format!(
+                "cannot watch non-UTF-8 path {path:?}"
+            )));
+        }
+        // Until the stream owns it (`FSEventStreamCreate` succeeds) we free `info` ourselves.
+        let info = Box::into_raw(Box::new(info));
+        let context = FSEventStreamContext {
+            version: 0,
+            info: info as *mut c_void,
+            retain: None,
+            release: Some(release_callback),
+            copy_description: None,
+        };
+        // SAFETY: `context` and `paths` are valid for the call (FSEvents copies both);
+        // `callback` matches the declared signature.
+        let stream = unsafe {
+            FSEventStreamCreate(
+                ptr::null(),
+                callback,
+                &context,
+                paths,
+                K_FS_EVENT_STREAM_EVENT_ID_SINCE_NOW,
+                0.1, // latency seconds; the worker also debounces via settle_time
+                K_FS_EVENT_STREAM_CREATE_FLAG_NO_DEFER | K_FS_EVENT_STREAM_CREATE_FLAG_WATCH_ROOT,
+            )
+        };
+        // SAFETY: we own the one reference `cf_path_array` returned.
+        unsafe { CFRelease(paths as *const c_void) };
+        if stream.is_null() {
+            // SAFETY: no stream exists, so nothing else holds `info`.
+            drop(unsafe { Box::from_raw(info) });
+            return Err(io::Error::other("FSEventStreamCreate failed"));
+        }
+        // From here `Drop` owns teardown, including on the error path below.
+        let mut stream = Stream {
+            stream,
+            queue,
+            started: false,
+        };
+        // SAFETY: `stream` is a live, unstarted stream and `queue` a live dispatch queue.
+        unsafe { FSEventStreamSetDispatchQueue(stream.stream, queue) };
+        // SAFETY: as above, with the queue already set.
+        if unsafe { FSEventStreamStart(stream.stream) } == 0 {
+            return Err(io::Error::other("FSEventStreamStart failed"));
+        }
+        stream.started = true;
+        Ok(stream)
+    }
+}
+
+impl Drop for Stream {
+    /// The only place a stream is torn down.
+    ///
+    /// Must not run on the dispatch queue: the barrier below would deadlock. The
+    /// callback never drops a stream or the watcher, so that cannot happen.
+    fn drop(&mut self) {
+        // SAFETY: `self.stream` is live and released exactly once, here. After
+        // `Invalidate` no new callback is scheduled, and the `dispatch_sync_f` on the
+        // serial queue returns only after any callback already running on it has
+        // finished, so the release callback frees `info` with no reader left.
+        unsafe {
+            if self.started {
+                FSEventStreamStop(self.stream);
+            }
+            FSEventStreamInvalidate(self.stream);
+            dispatch_sync_f(self.queue, ptr::null_mut(), noop);
+            FSEventStreamRelease(self.stream);
+        }
+    }
 }
 
 pub(crate) struct FsEventWatcher {
     shutdown: AtomicBool,
-    inner: Mutex<Inner>,
-    queue: *mut c_void, // serial dispatch queue the callback runs on
+    /// The serial queue every stream's callback runs on, which the barrier in
+    /// `Stream::drop` relies on. A NULL `attr` makes it serial.
+    queue: *mut c_void,
     pub changes: Arc<PendingChangesLock>,
     state: Arc<WatcherState>,
-    /// Newest event id seen, 0 before the first stream. A rebuilt stream resumes
-    /// from it, replaying the existing roots' events from the teardown window.
-    /// Written by the callback, read under `inner`'s lock.
-    last_event_id: Arc<AtomicU64>,
+    /// One running stream per root.
+    streams: Mutex<Vec<(CanonicalPathBuf, Stream)>>,
 }
 
-// The raw CF/dispatch pointers are only touched under `inner`'s lock or are
-// themselves thread-safe (dispatch queues, FSEvent streams). The watcher is
-// shared (Arc) between the worker thread and the dispatch queue.
+// SAFETY: `queue` is a thread-safe dispatch queue and everything else is `Send + Sync`.
 unsafe impl Send for FsEventWatcher {}
 unsafe impl Sync for FsEventWatcher {}
 
@@ -117,130 +210,57 @@ impl std::fmt::Debug for FsEventWatcher {
 
 impl FsEventWatcher {
     pub fn new(state: Arc<WatcherState>) -> io::Result<Arc<Self>> {
+        // SAFETY: the label is a valid C string; a NULL attribute makes the queue serial.
         let queue = unsafe { dispatch_queue_create(c"filesentry.fsevent".as_ptr(), ptr::null()) };
         if queue.is_null() {
             return Err(io::Error::other("dispatch_queue_create failed"));
         }
         Ok(Arc::new(Self {
             shutdown: AtomicBool::new(false),
-            inner: Mutex::new(Inner {
-                roots: Vec::new(),
-                stream: ptr::null_mut(),
-            }),
             queue,
             changes: Arc::new(PendingChangesLock::default()),
             state,
-            last_event_id: Arc::new(AtomicU64::new(0)),
+            streams: Mutex::new(Vec::new()),
         }))
-    }
-
-    /// (Re)build the single stream covering all current roots. FSEvents fixes the
-    /// path list at creation, so adding a root requires tearing down and
-    /// recreating the stream.
-    fn rebuild_stream(&self, inner: &mut Inner) -> io::Result<()> {
-        unsafe {
-            if !inner.stream.is_null() {
-                FSEventStreamStop(inner.stream);
-                FSEventStreamInvalidate(inner.stream);
-                FSEventStreamRelease(inner.stream);
-                inner.stream = ptr::null_mut();
-            }
-            if inner.roots.is_empty() {
-                return Ok(());
-            }
-            let paths = cf_paths(&inner.roots);
-            // The first build anchors on the current system id, so the next rebuild
-            // has one to resume from even if no event arrived in between.
-            let mut since_when = self.last_event_id.load(atomic::Ordering::Relaxed);
-            if since_when == 0 {
-                since_when = FSEventsGetCurrentEventId();
-                self.last_event_id
-                    .store(since_when, atomic::Ordering::Relaxed);
-            }
-            // The stream owns this heap `CallbackInfo` and frees it via
-            // `release_callback` only after the last callback, so an in-flight
-            // callback can never outlive the data it reads. See `CallbackInfo` for
-            // why it holds `Arc` clones rather than `self`.
-            let info = Box::into_raw(Box::new(CallbackInfo {
-                state: self.state.clone(),
-                changes: self.changes.clone(),
-                last_event_id: self.last_event_id.clone(),
-            }));
-            let mut context = FSEventStreamContext {
-                version: 0,
-                info: info as *mut c_void,
-                retain: None,
-                release: Some(release_callback),
-                copy_description: None,
-            };
-            let stream = FSEventStreamCreate(
-                ptr::null(),
-                callback,
-                &mut context,
-                paths,
-                since_when,
-                0.1, // latency seconds; the worker also debounces via settle_time
-                K_FS_EVENT_STREAM_CREATE_FLAG_NO_DEFER | K_FS_EVENT_STREAM_CREATE_FLAG_WATCH_ROOT,
-            );
-            CFRelease(paths as *const c_void);
-            if stream.is_null() {
-                // No stream took ownership of `info`, so free it here.
-                drop(Box::from_raw(info));
-                return Err(io::Error::other("FSEventStreamCreate failed"));
-            }
-            FSEventStreamSetDispatchQueue(stream, self.queue);
-            if !FSEventStreamStart(stream) {
-                FSEventStreamInvalidate(stream);
-                FSEventStreamRelease(stream);
-                return Err(io::Error::other("FSEventStreamStart failed"));
-            }
-            inner.stream = stream;
-        }
-        Ok(())
     }
 }
 
-impl crate::backend::Backend for FsEventWatcher {
+impl Backend for FsEventWatcher {
     fn changes(&self) -> &PendingChangesLock {
         &self.changes
     }
 
     fn watch_dir(&self, path: CanonicalPathBuf, _recursive: bool) -> io::Result<()> {
-        // FSEvents watches recursively, so only roots need a stream; a path
-        // already under a watched root is a no-op (the worker calls this per
-        // directory during the crawl, so most calls return here).
-        let mut inner = self.inner.lock().unwrap();
-        // Checked under `inner`'s lock: `shutdown` sets the flag *before* taking the
-        // same lock, so once it has run we won't build a new stream that nothing would
-        // ever release (Drop skips cleanup when already shut down) and whose callback
-        // would hold a dangling `info` pointer to a dropped watcher.
+        let mut streams = self.streams.lock().unwrap();
+        // Checked under the lock that `shutdown` takes after setting the flag, so no
+        // stream can be added once `shutdown` has cleared the list.
         if self.is_shutdown() {
             return Ok(());
         }
-        if inner
-            .roots
+        // FSEvents is recursive; the worker calls this per directory, so most calls end here.
+        if streams
             .iter()
-            .any(|r| r.is_parent_of(&path) || *r == path)
+            .any(|(r, _)| *r == path || r.is_parent_of(&path))
         {
             return Ok(());
         }
-        inner.roots.push(path);
-        self.rebuild_stream(&mut inner)?;
+        // A root added around existing roots keeps their streams: the overlap reports
+        // some paths twice, which the pending queue merges.
+        let stream = Stream::start(
+            &path,
+            self.queue,
+            CallbackInfo {
+                state: self.state.clone(),
+                changes: self.changes.clone(),
+            },
+        )?;
+        streams.push((path, stream));
         Ok(())
     }
 
     fn shutdown(&self) {
         self.shutdown.store(true, atomic::Ordering::Relaxed);
-        let mut inner = self.inner.lock().unwrap();
-        unsafe {
-            if !inner.stream.is_null() {
-                FSEventStreamStop(inner.stream);
-                FSEventStreamInvalidate(inner.stream);
-                FSEventStreamRelease(inner.stream);
-                inner.stream = ptr::null_mut();
-            }
-        }
-        drop(inner);
+        self.streams.lock().unwrap().clear();
         self.changes.notify();
     }
 
@@ -255,104 +275,71 @@ impl crate::backend::Backend for FsEventWatcher {
 
 impl Drop for FsEventWatcher {
     fn drop(&mut self) {
-        // Ensure the stream is gone before the dispatch queue is released.
-        if !self.is_shutdown() {
-            self.shutdown();
-        }
+        // Every stream must be gone before the queue is released.
+        self.shutdown();
+        // SAFETY: `queue` was created in `new` and no stream uses it any more.
         unsafe { dispatch_release(self.queue) };
     }
 }
 
-/// Build a retained `CFArray` of `CFString` paths for `FSEventStreamCreate`.
-unsafe fn cf_paths(paths: &[CanonicalPathBuf]) -> CFArrayRef {
-    let cfstrings: Vec<*const c_void> = paths
-        .iter()
-        .filter_map(|p| {
-            let bytes = p.as_std_path().as_os_str().as_bytes();
-            let s = CFStringCreateWithBytes(
-                kCFAllocatorDefault,
-                bytes.as_ptr(),
-                bytes.len() as CFIndex,
-                kCFStringEncodingUTF8,
-                false as u8,
-            );
-            // Returns NULL if the bytes aren't valid UTF-8 (a macOS path can be
-            // arbitrary bytes). Skip it -- putting NULL into the array would crash
-            // both CFArray's retain callback and the CFRelease loop below.
-            if s.is_null() {
-                log::error!("not watching root with non-UTF-8 path: {p:?}");
-                None
-            } else {
-                Some(s as *const c_void)
-            }
-        })
-        .collect();
+/// Build a retained one-element `CFArray` holding `path`; null if it is not UTF-8.
+///
+/// # Safety
+/// Caller releases a non-null result with `CFRelease`.
+unsafe fn cf_path_array(path: &CanonicalPathBuf) -> CFArrayRef {
+    let bytes = path.as_std_path().as_os_str().as_bytes();
+    let s = CFStringCreateWithBytes(
+        kCFAllocatorDefault,
+        bytes.as_ptr(),
+        bytes.len() as CFIndex,
+        kCFStringEncodingUTF8,
+        false as u8,
+    );
+    if s.is_null() {
+        return ptr::null();
+    }
+    let items = [s as *const c_void];
     let array = CFArrayCreate(
         kCFAllocatorDefault,
-        cfstrings.as_ptr(),
-        cfstrings.len() as CFIndex,
-        &kCFTypeArrayCallBacks, // the array retains the strings…
+        items.as_ptr(),
+        1,
+        &kCFTypeArrayCallBacks, // the array retains the string…
     );
-    for s in cfstrings {
-        CFRelease(s); // …so we drop our references
-    }
+    CFRelease(s as *const c_void); // …so we drop our reference
     array
-}
-
-/// Heap payload handed to the FSEvents callback via the stream context's `info`.
-/// Holds clones of the `Arc`s the callback touches (not the whole `FsEventWatcher`,
-/// which would create a stream <-> watcher reference cycle). Freed by
-/// `release_callback` when the stream is released.
-struct CallbackInfo {
-    state: Arc<WatcherState>,
-    changes: Arc<PendingChangesLock>,
-    last_event_id: Arc<AtomicU64>,
 }
 
 /// Called by FSEvents when the stream is released; frees the `CallbackInfo` box.
 extern "C" fn release_callback(info: *const c_void) {
+    // SAFETY: `info` is the box leaked in `Stream::start`, released exactly once.
     drop(unsafe { Box::from_raw(info as *mut CallbackInfo) });
 }
 
-/// FSEvents callback (runs on the dispatch queue). Each entry is a changed
-/// directory; we don't trust the coalesced detail and enqueue a non-recursive
-/// crawl of each, or a full recrawl on `MustScanSubDirs`. Mirrors
-/// `InotifyWatcher::handle_event`.
+/// FSEvents callback (runs on the dispatch queue).
 extern "C" fn callback(
     _stream: ConstFSEventStreamRef,
     info: *mut c_void,
     num_events: usize,
     event_paths: *mut c_void,
     event_flags: *const FSEventStreamEventFlags,
-    event_ids: *const FSEventStreamEventId,
+    _event_ids: *const FSEventStreamEventId,
 ) {
-    // This runs from libdispatch through C frames, where a panic unwinding across
-    // an `extern "C"` fn aborts the whole host process (helix), not just the
-    // watcher. Contain it: log and drop the batch.
+    // A panic unwinding through this `extern "C"` frame would abort the host process.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // `from_raw_parts` requires a non-null, aligned pointer even for len 0, and
-        // a 0-event callback has nothing to do anyway.
+        // `from_raw_parts` needs a non-null pointer even for len 0.
         if num_events == 0 {
             return;
         }
-        // SAFETY: `info` is the `CallbackInfo` boxed at stream creation; the stream
-        // keeps it alive until after the last callback (see `rebuild_stream`).
-        // `event_paths` is a `char **` and `event_flags`/`event_ids` are arrays,
-        // all of `num_events`.
+        // SAFETY: `info` outlives every callback: `Stream::drop` waits for the running
+        // callback before the stream's release callback frees it.
         let info = unsafe { &*(info as *const CallbackInfo) };
-        let paths = event_paths as *const *const i8;
+        let paths = event_paths as *const *const c_char;
+        // SAFETY: FSEvents passes `num_events` flags.
         let flags = unsafe { std::slice::from_raw_parts(event_flags, num_events) };
-        // Record the newest id so a stream rebuild resumes just after it. Ids are
-        // monotonic within (and across) batches; the `HistoryDone` sentinel and
-        // other synthetic events carry id 0, so skip those.
-        let ids = unsafe { std::slice::from_raw_parts(event_ids, num_events) };
-        if let Some(&id) = ids.iter().rev().find(|&&id| id != 0) {
-            info.last_event_id.store(id, atomic::Ordering::Relaxed);
-        }
         let events = (0..num_events).map(|i| {
+            // SAFETY: FSEvents passes `num_events` NUL-terminated paths valid for this call.
             let cstr = unsafe { CStr::from_ptr(*paths.add(i)) };
-            let os = std::ffi::OsStr::from_bytes(cstr.to_bytes());
-            (std::path::Path::new(os), flags[i])
+            (Path::new(OsStr::from_bytes(cstr.to_bytes())), flags[i])
         });
         process_events(info, events);
     }));
@@ -363,25 +350,21 @@ extern "C" fn callback(
 
 /// Strip a single trailing `/` from an FSEvents path (kept off the root `/`
 /// itself), restoring `CanonicalPathBuf`'s "never ends in a separator" invariant.
-fn strip_trailing_sep(path: &std::path::Path) -> &std::path::Path {
+fn strip_trailing_sep(path: &Path) -> &Path {
     let bytes = path.as_os_str().as_bytes();
     match bytes.strip_suffix(b"/") {
-        Some(stripped) if !stripped.is_empty() => {
-            std::path::Path::new(std::ffi::OsStr::from_bytes(stripped))
-        }
+        Some(stripped) if !stripped.is_empty() => Path::new(OsStr::from_bytes(stripped)),
         _ => path,
     }
 }
 
-/// Body of the FSEvents callback, split out so it can be unit-tested without a
-/// live stream and so the panic-containing wrapper in [`callback`] stays tiny.
+/// Body of the callback, split out so tests can run it without a live stream.
 fn process_events<'a>(
     info: &CallbackInfo,
-    events: impl Iterator<Item = (&'a std::path::Path, FSEventStreamEventFlags)>,
+    events: impl Iterator<Item = (&'a Path, FSEventStreamEventFlags)>,
 ) {
-    // Tolerate a poisoned config lock rather than unwrap: a panicking handler
-    // poisons it (it's held across handlers in `worker::Worker::run`), and we only
-    // read the filter here, where a stale-but-valid value is fine.
+    // A panicking handler poisons the config lock. Only the filter is read here, so
+    // the poisoned value is still fine to use.
     let filter = info
         .state
         .config
@@ -389,26 +372,40 @@ fn process_events<'a>(
         .unwrap_or_else(|err| err.into_inner())
         .filter
         .clone();
-    let mut changes = info.changes.lock();
-    for (path, flag) in events {
-        if flag & K_FS_EVENT_STREAM_EVENT_FLAG_MUST_SCAN_SUBDIRS != 0 {
-            changes.recrawl();
-            break;
-        }
-        // FSEvents reports directories with a trailing `/`, which would not match
-        // the tree's `foo/bar`.
-        let path = strip_trailing_sep(path);
-        let path = CanonicalPathBuf::assert_canonicalized(path);
-        // `ignore_path_rec`, not `ignore_path`: FSEvents has no per-directory
-        // exclusion, so it reports writes under an ignored directory too. inotify
-        // never sees those (it adds no watch there); to match, drop any path with an
-        // ignored *ancestor*, not just a directly-ignored leaf.
-        if filter.ignore_path_rec(path.as_std_path(), Some(true)) {
+    // All fallible work happens here, so the pending-queue lock below is held only
+    // for infallible pushes and cannot be poisoned by a panic in this function.
+    let mut recrawl = false;
+    let mut dirs = Vec::new();
+    for (path, flags) in events {
+        // The `HistoryDone` sentinel has an empty path.
+        if path.as_os_str().is_empty() {
             continue;
         }
-        changes.add(path, true);
+        if flags & RESCAN_FLAGS != 0 {
+            recrawl = true;
+            break;
+        }
+        // FSEvents reports directories with a trailing `/`, unlike the tree's `foo/bar`.
+        let path = CanonicalPathBuf::assert_canonicalized(strip_trailing_sep(path));
+        // FSEvents also reports writes under ignored directories, which inotify
+        // never sees, so drop any path with an ignored ancestor.
+        if !filter.ignore_path_rec(path.as_std_path(), Some(true)) {
+            dirs.push(path);
+        }
     }
-    drop(changes);
+    if !recrawl && dirs.is_empty() {
+        return;
+    }
+    {
+        let mut changes = info.changes.lock();
+        if recrawl {
+            changes.recrawl();
+        } else {
+            for dir in dirs {
+                changes.add(dir, true);
+            }
+        }
+    }
     info.changes.notify();
 }
 
@@ -427,7 +424,6 @@ mod tests {
         let info = CallbackInfo {
             state: watcher.state.clone(),
             changes: watcher.notify.changes.clone(),
-            last_event_id: watcher.notify.last_event_id.clone(),
         };
 
         // Poison the config mutex the way a panicking handler would.
@@ -457,7 +453,6 @@ mod tests {
         let info = CallbackInfo {
             state: watcher.state.clone(),
             changes: watcher.notify.changes.clone(),
-            last_event_id: watcher.notify.last_event_id.clone(),
         };
 
         process_events(
@@ -482,7 +477,6 @@ mod tests {
         let info = CallbackInfo {
             state: watcher.state.clone(),
             changes: watcher.notify.changes.clone(),
-            last_event_id: watcher.notify.last_event_id.clone(),
         };
 
         // A directory *inside* an ignored `.git` -- the leaf itself is not `.git`.
@@ -506,37 +500,148 @@ mod tests {
         );
     }
 
-    /// A second root rebuilds the stream, which resumes from `last_event_id`
-    /// instead of forcing a recrawl.
+    /// The `HistoryDone` sentinel (empty path) is ignored, not recorded as a root dir.
     #[test]
-    fn adding_a_root_resumes_without_recrawl() {
+    fn callback_skips_empty_path() {
+        let watcher = Watcher::new().unwrap();
+        let info = CallbackInfo {
+            state: watcher.state.clone(),
+            changes: watcher.notify.changes.clone(),
+        };
+        process_events(&info, std::iter::once((Path::new(""), 0x10u32)));
+        assert!(info.changes.lock().is_empty());
+    }
+
+    /// Dropped/coalesced events request a full recrawl.
+    #[test]
+    fn callback_recrawls_on_must_scan() {
+        let watcher = Watcher::new().unwrap();
+        let info = CallbackInfo {
+            state: watcher.state.clone(),
+            changes: watcher.notify.changes.clone(),
+        };
+        process_events(&info, std::iter::once((Path::new("/tmp/x"), 0x1u32)));
+        assert!(info.changes.lock().take_recrawl());
+    }
+
+    fn canonical_tempdir() -> (tempfile::TempDir, std::path::PathBuf) {
+        // Not `.tmp*`-prefixed (hidden), and canonical: /var is a symlink to /private/var,
+        // which is what FSEvents reports.
+        let dir = tempfile::Builder::new()
+            .prefix("fsentry")
+            .tempdir()
+            .unwrap();
+        let canon = dir.path().canonicalize().unwrap();
+        (dir, canon)
+    }
+
+    /// Wait until a change under `dir` is pending.
+    fn saw_change_under(fs: &super::FsEventWatcher, dir: &Path) -> bool {
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let mut changes = fs.changes.lock();
+            if changes
+                .drain()
+                .any(|c| c.path.as_std_path().starts_with(dir))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Each separately added root gets its own stream and reports writes.
+    #[test]
+    fn two_separate_roots_both_report() {
         use crate::backend::Backend;
-        use std::sync::atomic::Ordering;
 
         let watcher = Watcher::new().unwrap();
         let fs = &watcher.notify;
-        let d1 = tempfile::tempdir().unwrap();
-        let d2 = tempfile::tempdir().unwrap();
-
-        // First root builds the initial stream and anchors `last_event_id` on the
-        // current system id, giving later rebuilds a concrete point to resume from.
-        fs.watch_dir(CanonicalPathBuf::assert_canonicalized(d1.path()), true)
+        let (_d1, p1) = canonical_tempdir();
+        let (_d2, p2) = canonical_tempdir();
+        fs.watch_dir(CanonicalPathBuf::assert_canonicalized(&p1), true)
             .unwrap();
-        assert!(!fs.changes.lock().take_recrawl());
-        assert_ne!(
-            fs.last_event_id.load(Ordering::Relaxed),
-            0,
-            "the first build must anchor last_event_id so rebuilds can resume",
-        );
-
-        // A second, unrelated root rebuilds the stream. Because it resumes from
-        // last_event_id, the existing root's buffered events are replayed and no
-        // recrawl is needed.
-        fs.watch_dir(CanonicalPathBuf::assert_canonicalized(d2.path()), true)
+        fs.watch_dir(CanonicalPathBuf::assert_canonicalized(&p2), true)
             .unwrap();
         assert!(
             !fs.changes.lock().take_recrawl(),
-            "resuming from last_event_id must not force a recrawl",
+            "adding a root must not force a recrawl"
         );
+
+        std::fs::write(p1.join("a"), b"1").unwrap();
+        assert!(
+            saw_change_under(fs, &p1),
+            "no change reported for the first root"
+        );
+        std::fs::write(p2.join("b"), b"2").unwrap();
+        assert!(
+            saw_change_under(fs, &p2),
+            "no change reported for the second root"
+        );
+    }
+
+    /// A root whose stream cannot be created leaves existing streams running and is
+    /// not recorded. A non-UTF-8 path fails deterministically (CFString creation).
+    #[test]
+    fn failed_root_keeps_existing_roots() {
+        use crate::backend::Backend;
+        use std::os::unix::ffi::OsStrExt;
+
+        let watcher = Watcher::new().unwrap();
+        let fs = &watcher.notify;
+        let (_d1, p1) = canonical_tempdir();
+        fs.watch_dir(CanonicalPathBuf::assert_canonicalized(&p1), true)
+            .unwrap();
+
+        let bad = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/filesentry-\xff"));
+        assert!(fs
+            .watch_dir(CanonicalPathBuf::assert_canonicalized(bad), true)
+            .is_err());
+        assert_eq!(fs.streams.lock().unwrap().len(), 1);
+
+        std::fs::write(p1.join("a"), b"1").unwrap();
+        assert!(
+            saw_change_under(fs, &p1),
+            "the first root must still report"
+        );
+    }
+
+    /// A root inside an existing one adds nothing. A root around existing ones adds
+    /// a stream and keeps the inner ones.
+    #[test]
+    fn nested_roots() {
+        use crate::backend::Backend;
+
+        let watcher = Watcher::new().unwrap();
+        let fs = &watcher.notify;
+        let (_d, p) = canonical_tempdir();
+        let inner = p.join("outer").join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+
+        fs.watch_dir(CanonicalPathBuf::assert_canonicalized(&inner), true)
+            .unwrap();
+        fs.watch_dir(CanonicalPathBuf::assert_canonicalized(&inner), true)
+            .unwrap();
+        assert_eq!(fs.streams.lock().unwrap().len(), 1);
+        fs.watch_dir(CanonicalPathBuf::assert_canonicalized(&p), true)
+            .unwrap();
+        assert_eq!(fs.streams.lock().unwrap().len(), 2);
+        fs.watch_dir(CanonicalPathBuf::assert_canonicalized(&inner), true)
+            .unwrap();
+        assert_eq!(fs.streams.lock().unwrap().len(), 2);
+    }
+
+    /// After shutdown `watch_dir` adds nothing.
+    #[test]
+    fn no_streams_after_shutdown() {
+        use crate::backend::Backend;
+
+        let watcher = Watcher::new().unwrap();
+        let fs = &watcher.notify;
+        let (_d, p) = canonical_tempdir();
+        fs.shutdown();
+        fs.watch_dir(CanonicalPathBuf::assert_canonicalized(&p), true)
+            .unwrap();
+        assert!(fs.streams.lock().unwrap().is_empty());
     }
 }
