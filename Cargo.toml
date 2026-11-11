@@ -20,12 +20,7 @@ ignore = "0.4.23"
 
 # Unix-only (metadata module uses rustix for lstat)
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.0.7", features = ["fs"] }
-
-# Linux-only (inotify module)
-[target.'cfg(target_os = "linux")'.dependencies]
-papaya = "0.2.1"
-mio = { version = "1.0.4", features = ["os-ext"] }
+rustix = { version = "1.0.7", features = ["fs", "event"] }
 
 # macOS FSEvents backend
 [target.'cfg(target_os = "macos")'.dependencies]
