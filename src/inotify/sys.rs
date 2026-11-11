@@ -65,19 +65,18 @@ impl Inotify {
         Ok(Watch(watch))
     }
 
-    // pub(super) fn remove_watch(&self, watch: Watch) -> io::Result<()> {
-    //     inotify::remove_watch(self.as_fd(), watch.0)?;
-    //     Ok(())
-    // }
+    pub(super) fn remove_watch(&self, watch: &Watch) -> io::Result<()> {
+        inotify::remove_watch(self.as_fd(), watch.0)?;
+        Ok(())
+    }
 
     pub(super) fn event_loop<T>(
         &self,
         poll: &mut Poll,
         state: &mut T,
-        mut handle_event: impl FnMut(&mut T, Event<'_> /* , SystemTime */),
+        mut handle_event: impl FnMut(&mut T, Event<'_>),
         mut event_stream_done: impl FnMut(&mut T),
         mut handle_message: impl FnMut(&mut T) -> bool,
-        #[cfg(test)] slow: bool,
     ) -> io::Result<()> {
         let mut buf = vec![0u32; BUFFERSIZE].into_boxed_slice();
         let buf_bytes = unsafe {
@@ -103,7 +102,6 @@ impl Inotify {
                 Ok(()) => {}
             }
 
-            // let time = SystemTime::now();
             let mut message = false;
             let mut inotify = false;
             for event in &events {
@@ -118,15 +116,6 @@ impl Inotify {
                 break;
             }
             if inotify {
-                // to reliably reproduce queue overflow we need to read events slowly
-                // particularly this need to be done here where we read the FD and not in
-                // the event handler callback, I think that is because our buffer size
-                // is quite big
-                #[cfg(test)]
-                if slow {
-                    use crate::tests::READ_DELAY;
-                    std::thread::sleep(*READ_DELAY);
-                }
                 loop {
                     let event = match reader.next() {
                         Err(Errno::AGAIN | Errno::INVAL) => break,
@@ -141,7 +130,7 @@ impl Inotify {
                                 OsStr::from_encoded_bytes_unchecked(src.to_bytes())
                             }),
                             flags: event.events(),
-                        }, /* , time */
+                        },
                     );
                 }
                 event_stream_done(state)

@@ -1,11 +1,6 @@
-//! The native file-watching backend abstraction.
-//!
-//! The worker and [`crate::Watcher`] are written against this trait so a backend
-//! can be selected per target OS ([`NativeBackend`]) instead of hardcoding
-//! `InotifyWatcher`. A backend owns a [`PendingChangesLock`] that it pushes raw
-//! change notifications into (and whose condvar it signals). The worker drains it,
-//! re-stats the affected paths and diffs them against the in-memory tree. This is
-//! the entire surface the rest of the crate needs.
+//! The native watcher interface. A backend pushes raw change notifications into
+//! its [`PendingChangesLock`] and signals it; the worker drains it, re-stats the
+//! paths and diffs them against the tree.
 
 use std::io;
 
@@ -31,7 +26,7 @@ pub(crate) trait Backend: Send + Sync + 'static {
     fn refresh_config(&self);
 }
 
-// Selected per OS; , otherwise the watcher is compiled out and helix falls back to polling.
+// Other targets compile the watcher out (see build.rs).
 #[cfg(target_os = "linux")]
 pub(crate) type NativeBackend = crate::inotify::InotifyWatcher;
 #[cfg(target_os = "macos")]

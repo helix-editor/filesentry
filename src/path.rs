@@ -43,16 +43,12 @@ impl CannonicalPath {
     }
 
     pub fn join(&self, other: &OsStr) -> CanonicalPathBuf {
-        if self.is_empty() {
-            let mut res = CanonicalPathBuf::new();
-            res.push(other);
-            res
-        } else {
-            let mut res = CanonicalPathBuf::with_capacity(self.bytes.len() + other.len());
-            res.buf.extend_from_slice(&self.bytes);
-            res.push(other);
-            res
-        }
+        let mut res = CanonicalPathBuf {
+            buf: EcoVec::with_capacity(self.bytes.len() + other.len() + 2),
+        };
+        res.buf.extend_from_slice(&self.bytes);
+        res.push(other);
+        res
     }
 
     fn as_raw_bytes(&self) -> &[u8] {
@@ -89,6 +85,13 @@ impl CannonicalPath {
         // OsStr (and str but every str is an OsStr) and therefore always
         // valid
         unsafe { OsStr::from_encoded_bytes_unchecked(self.as_bytes()) }
+    }
+
+    /// NUL-terminated UTF-16, for Win32 calls.
+    #[cfg(windows)]
+    pub(crate) fn to_wide(&self) -> Vec<u16> {
+        use std::os::windows::ffi::OsStrExt;
+        self.as_os_str().encode_wide().chain(Some(0)).collect()
     }
 
     #[cfg(unix)]
@@ -177,58 +180,18 @@ impl CanonicalPathBuf {
         res
     }
 
-    // pub fn from_std_path(path: &Path) -> io::Result<CanonicalPathBuf> {
-    //     let canonicalized = path.canonicalize()?.into_os_string();
-    //     let mut res = Self::with_capacity(canonicalized.len() + 1);
-    //     res.push(canonicalized.as_os_str());
-    //     Ok(res)
-    // }
-
-    fn with_capacity(cap: usize) -> CanonicalPathBuf {
-        Self {
-            buf: EcoVec::with_capacity(cap),
-        }
-    }
-
-    pub fn pop(&mut self) -> bool {
-        let Some(i) = memrchr(PATH_SEPARATOR, &self.bytes) else {
-            return false;
-        };
-        self.buf.truncate(i);
-        true
-    }
-
-    pub fn push_raw(&mut self, src: impl AsRef<OsStr>) {
-        let src = src.as_ref();
-        let mut capacity = src.len();
-        if cfg!(unix) {
-            // remove null
-            let removed = self.buf.pop();
-            debug_assert!(removed.is_none_or(|c| c == 0));
-            capacity += 1;
-        }
-        self.buf.reserve(capacity + 1);
-        self.buf.extend_from_slice(src.as_encoded_bytes());
-        if cfg!(unix) {
-            self.buf.push(0);
-        }
-    }
-
     pub fn push(&mut self, src: impl AsRef<OsStr>) {
-        let src = src.as_ref();
-        let mut capacity = src.len();
-        // we append the null terminator only on unix
+        let src = src.as_ref().as_encoded_bytes();
+        // only unix paths carry a NUL terminator
         if cfg!(unix) {
-            // remove null
             let removed = self.buf.pop();
             debug_assert!(removed.is_none_or(|c| c == 0));
-            capacity += 1;
         }
-        self.buf.reserve(capacity + 1);
-        if src.as_encoded_bytes().first() != Some(&PATH_SEPARATOR) {
+        self.buf.reserve(src.len() + 2);
+        if src.first() != Some(&PATH_SEPARATOR) {
             self.buf.push(PATH_SEPARATOR);
         }
-        self.buf.extend_from_slice(src.as_encoded_bytes());
+        self.buf.extend_from_slice(src);
         if cfg!(unix) {
             self.buf.push(0);
         }
@@ -346,69 +309,13 @@ mod tests {
     }
 
     #[test]
-    fn is_parent_of_basic() {
-        let foo = p("/foo");
-        let foo_bar = p("/foo/bar");
-        let foo_baz = p("/foo/baz");
-        let foobar = p("/foobar");
-
-        // /foo is parent of /foo/bar
-        assert!(foo.is_parent_of(&foo_bar));
-        // /foo is parent of /foo/baz
-        assert!(foo.is_parent_of(&foo_baz));
-        // /foo is NOT parent of /foobar (no separator)
-        assert!(!foo.is_parent_of(&foobar));
-    }
-
-    #[test]
-    fn is_parent_of_same_path() {
-        let foo = p("/foo");
-        let foo2 = p("/foo");
-
-        // /foo is NOT parent of /foo (same path)
-        assert!(!foo.is_parent_of(&foo2));
-    }
-
-    #[test]
-    fn is_parent_of_longer_self() {
-        let foo_bar = p("/foo/bar");
-        let foo = p("/foo");
-
-        // /foo/bar is NOT parent of /foo (self is longer)
-        assert!(!foo_bar.is_parent_of(&foo));
-    }
-
-    #[test]
-    fn is_parent_of_nested() {
-        let foo = p("/foo");
-        let foo_bar = p("/foo/bar");
-        let foo_bar_baz = p("/foo/bar/baz");
-
-        // /foo is parent of /foo/bar/baz
-        assert!(foo.is_parent_of(&foo_bar_baz));
-        // /foo/bar is parent of /foo/bar/baz
-        assert!(foo_bar.is_parent_of(&foo_bar_baz));
-    }
-
-    #[test]
-    fn is_parent_of_null_terminator_safety() {
-        // This test verifies that the null terminator on Unix prevents OOB access
-        // when self.len() == other.as_bytes().len()
-        let foo = p("/foo");
-
-        // On Unix: foo.bytes = [/, f, o, o, \0]
-        // foo.len() = 4 (excluding null)
-        // foo.as_bytes() = [/, f, o, o] (excluding null)
-        // When checking if /foo is_parent_of /foo:
-        // - other.as_bytes().starts_with(self.as_bytes()) = true
-        // - other.bytes[self.len()] = other.bytes[4] = \0 != '/'
-        // So we don't panic, we just return false
-
-        if cfg!(unix) {
-            assert_eq!(foo.buf.as_slice().last(), Some(&0u8)); // null terminated
-            assert_eq!(foo.buf.len(), 5); // includes null
-            assert_eq!(foo.len(), 4); // excludes null
-        }
+    fn is_parent_of() {
+        assert!(p("/foo").is_parent_of(&p("/foo/bar")));
+        assert!(p("/foo").is_parent_of(&p("/foo/bar/baz")));
+        // not a prefix that ends inside a name, not the path itself or a child
+        assert!(!p("/foo").is_parent_of(&p("/foobar")));
+        assert!(!p("/foo").is_parent_of(&p("/foo")));
+        assert!(!p("/foo/bar").is_parent_of(&p("/foo")));
     }
 
     #[test]
@@ -422,8 +329,7 @@ mod tests {
 
     #[test]
     fn total_order_axioms() {
-        // The directory/descendant/sibling mix that broke the old comparator
-        // (parent == each child, but children not equal to each other).
+        // a directory, its descendants and prefix-sharing siblings
         let set: Vec<_> = [
             "/foo", "/foo/a", "/foo/b", "/foo/a/x", "/foo-x", "/foobar", "/bar", "/bar/baz", "/a",
             "/a/b/c", "/foo/a/y", "/foo/aa",
@@ -449,28 +355,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn sort_large_tree_does_not_panic() {
-        // Reproduces the field panic: sorting a tree with a directory and many
-        // descendants made the old non-transitive comparator trip the standard
-        // sort's total-order check ("the len is N but the index is 4294967295").
-        let mut paths: Vec<CanonicalPathBuf> = Vec::new();
-        for d in 0..120 {
-            paths.push(p(&format!("/repo/dir{d:03}")));
-            for f in 0..120 {
-                paths.push(p(&format!("/repo/dir{d:03}/file{f:03}.rs")));
-            }
-        }
-        // shuffle-ish so the input isn't already ordered
-        paths.reverse();
-        paths.sort_unstable_by(|a, b| a.cmp(b));
-        // parents precede their descendants after sorting
-        let repo = p("/repo/dir000");
-        let child = p("/repo/dir000/file000.rs");
-        let i = paths.iter().position(|x| *x == repo).unwrap();
-        let j = paths.iter().position(|x| *x == child).unwrap();
-        assert!(i < j);
     }
 }

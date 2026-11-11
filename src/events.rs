@@ -12,8 +12,7 @@ pub enum EventType {
     Create,
     Delete,
     Modified,
-    /// a file that was added and removed again immedietly
-    /// (within the settle period) can usually be ignored
+    /// Created and deleted again within one settle window; usually safe to ignore.
     Tempfile,
 }
 
@@ -50,7 +49,6 @@ impl EventDebouncer {
                 let i = *entry.get() as usize;
                 let event = &mut self.events.make_mut()[i];
                 match (event.ty, ty) {
-                    // temporary file that was created and immidiately removed
                     (EventType::Create, EventType::Delete) => event.ty = EventType::Tempfile,
                     (_, EventType::Delete) => {
                         event.ty = EventType::Delete;
@@ -58,9 +56,7 @@ impl EventDebouncer {
                     (EventType::Delete, EventType::Create) => {
                         event.ty = EventType::Modified;
                     }
-                    // A tempfile (created then deleted within the window) that is created
-                    // again exists once more: report it as a `Create`, not a `Tempfile`
-                    // (which the consumer would ignore).
+                    // it exists again: a `Tempfile` would be ignored
                     (EventType::Tempfile, EventType::Create) => {
                         event.ty = EventType::Create;
                     }

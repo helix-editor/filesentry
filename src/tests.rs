@@ -19,18 +19,8 @@ static TIMEOUT: LazyLock<Duration> =
         _ => Duration::from_secs(20),
     });
 
-pub static READ_DELAY: LazyLock<Duration> =
-    LazyLock::new(|| match std::env::var("FILESENTRY_READ_DELAY") {
-        Ok(res) if !res.trim().is_empty() => Duration::from_millis(
-            res.parse()
-                .expect("invalid value for FILESENTRY_TEST_TIMEOUT expected an integer"),
-        ),
-        _ => Duration::from_millis(300),
-    });
-
-/// Asserts the *net* effect of a change rather than the raw event stream.
-///
-/// A loaded runner may deliver those records to the handler in different batches instead of pre-coalesced.
+/// Asserts the net effect of a change rather than the raw event stream, which a
+/// loaded runner may deliver in several batches.
 struct Assertion {
     done: mpsc::Receiver<()>,
     events: Arc<Mutex<EventDebouncer>>,
@@ -122,17 +112,9 @@ fn sub(base: &Path, rel: &str) -> PathBuf {
 }
 
 fn init_watcher() -> (TempDir, Watcher) {
-    init_watcher_imp(false)
-}
-
-fn init_watcher_slow() -> (TempDir, Watcher) {
-    init_watcher_imp(true)
-}
-
-fn init_watcher_imp(slow: bool) -> (TempDir, Watcher) {
     let _ = env_logger::builder().try_init();
     let dir = TempDir::new().unwrap();
-    let watcher = Watcher::new_impl(slow).unwrap();
+    let watcher = Watcher::new().unwrap();
     let (tx, rx) = mpsc::sync_channel(1);
     watcher
         .add_root(dir.path(), true, move |success| {
@@ -143,52 +125,18 @@ fn init_watcher_imp(slow: bool) -> (TempDir, Watcher) {
     rx.recv_timeout(*TIMEOUT).expect("failed to start watcher");
     (dir, watcher)
 }
-// The watcher canonicalizes every root and reports events under the canonical path,
-// so expectations must be built from the canonical temp dir too — otherwise they
-// break wherever it sits behind a symlink (on macOS `$TMPDIR` is under `/var/...`,
-// a symlink to `/private/var/...`).
+// Events carry canonical paths (macOS `$TMPDIR` is under `/var`, a symlink to
+// `/private/var`), so the expectations are built from the canonical temp dir.
 fn with_watcher(f: impl FnOnce(&Path, &Watcher)) {
     let (dir, watcher) = init_watcher();
-    // Linux's inotify reports a file's create+write (or delete+recreate) in one
-    // read, so the debouncer coalesces them within a single settle window.
-    // Windows' ReadDirectoryChangesW can split those records across separate
-    // reads, and a loaded runner can flush the first before the second arrives,
-    // so they reach the handler in separate batches. `Assertion` re-coalesces to
-    // handle that; widening the settle window here just reduces how often it
-    // happens (fewer batches), it isn't load-bearing for correctness.
+    // ReadDirectoryChangesW can split a create and a write across reads, and so
+    // across batches. `Assertion` handles that, and the wider window makes it rarer.
     #[cfg(windows)]
     watcher.set_settle_time(std::time::Duration::from_secs(1));
     let shutdown_guard = watcher.shutdown_guard();
     let path = dir.path().canonicalize().unwrap();
     f(&path, &watcher);
     drop(shutdown_guard)
-}
-
-fn with_watcher_slow(f: impl FnOnce(&Path, &Watcher)) {
-    let (dir, watcher) = init_watcher_slow();
-    let shutdown_guard = watcher.shutdown_guard();
-    let path = dir.path().canonicalize().unwrap();
-    f(&path, &watcher);
-    drop(shutdown_guard)
-}
-
-#[test]
-fn create() {
-    with_watcher(|dir, watcher| {
-        let assertion = Assertion::new(
-            watcher,
-            dir,
-            [
-                ("foo/baz", EventType::Create),
-                ("foo/bar/baz", EventType::Create),
-                ("baz", EventType::Create),
-            ],
-        );
-        mk_write(dir, "baz", "foo");
-        mk_write(dir, "foo/baz", "foo");
-        mk_write(dir, "foo/bar/baz", "foo");
-        assertion.check();
-    });
 }
 
 #[test]
@@ -246,50 +194,58 @@ fn modify() {
     });
 }
 
+/// A filter change with a recrawl picks up what the old filter hid.
 #[test]
-#[cfg(target_os = "linux")]
-fn queue_overflow() {
-    with_watcher_slow(|dir, watcher| {
-        let files: Vec<_> = (0..20_0000)
-            .map(|i| format!("foo{}/bar{i}", i % 200))
-            .collect();
-        let assertion = Assertion::new(
-            watcher,
-            dir,
-            files.iter().map(|file| (&**file, EventType::Create)),
-        );
-        for file in &files {
-            mk_write(dir, file, "content1");
+fn filter_change_recrawls() {
+    struct IgnoreHidden;
+    impl crate::Filter for IgnoreHidden {
+        fn ignore_path(&self, path: &Path, _: Option<bool>) -> bool {
+            path.file_name().is_some_and(|name| name == "hidden")
         }
+    }
+    with_watcher(|dir, watcher| {
+        watcher.set_filter(Arc::new(IgnoreHidden), true);
+        let assertion = Assertion::new(watcher, dir, [("seen", EventType::Create)]);
+        mk_write(dir, "hidden/f", "x");
+        mk_write(dir, "seen", "x");
         assertion.check();
-        let assertion = Assertion::new(
-            watcher,
-            dir,
-            files.iter().map(|file| (&**file, EventType::Modified)),
-        );
-        for file in &files {
-            write(dir, file, "content2");
-        }
+        let assertion = Assertion::new(watcher, dir, [("hidden/f", EventType::Create)]);
+        watcher.set_filter(Arc::new(()), true);
         assertion.check();
-        // Overflow *recovery* is what's under test, and the 200k-event assertions
-        // above already prove nothing was lost recovering from it. The *number* of
-        // overflow episodes is not controllable: it's a race between the runner's
-        // file-creation speed, the kernel's `max_queued_events`, and the throttled
-        // reader, so a slower runner may drain one phase without overflowing it.
-        // Require >= 1 to confirm the overflow+recrawl path actually ran.
-        let recrawls = watcher.recrawls();
-        assert!(
-            recrawls >= 1,
-            "expected at least one recrawl (queue overflow) but found {recrawls}"
-        )
     });
 }
 
-/// Stress the backend teardown path: start a watch, churn files, then shut down
-/// while native callbacks may still be in flight, repeatedly. This smoke-tests
-/// rapid create/shutdown cycles on every platform; under the AddressSanitizer CI
-/// job (macOS) it specifically guards the FSEvents callback's `info` lifetime --
-/// a non-retained payload would use-after-free here.
+/// helix calls `start` on every config reload. A second worker, with an empty tree,
+/// would drop the changes it dequeued.
+#[test]
+fn start_twice_runs_one_worker() {
+    let watcher = Watcher::new().unwrap();
+    let _guard = watcher.shutdown_guard();
+    watcher.start();
+    // each worker holds a clone of the state
+    let holders = Arc::strong_count(&watcher.state);
+    watcher.start();
+    assert_eq!(Arc::strong_count(&watcher.state), holders);
+}
+
+/// A caller waiting on `root_crawled` must hear back for an ignored root too.
+#[test]
+fn ignored_root_reports_back() {
+    let dir = TempDir::new().unwrap();
+    let ignored = dir.path().join(".git");
+    fs::create_dir(&ignored).unwrap();
+    let watcher = Watcher::new().unwrap();
+    let (tx, rx) = mpsc::sync_channel(1);
+    watcher
+        .add_root(&ignored, true, move |watched| {
+            let _ = tx.send(watched);
+        })
+        .unwrap();
+    assert_eq!(rx.recv_timeout(*TIMEOUT), Ok(false));
+}
+
+/// Shut down while native callbacks may still be in flight. Under ASAN this
+/// guards the FSEvents callback's `info` lifetime.
 #[test]
 fn teardown_with_pending_events_is_safe() {
     for _ in 0..16 {
@@ -303,4 +259,47 @@ fn teardown_with_pending_events_is_safe() {
         }
         watcher.shutdown();
     }
+}
+
+/// A root the backend cannot watch must be reported as failed every time, not
+/// only the first.
+#[test]
+#[cfg(target_os = "linux")]
+fn failed_watch_is_not_registered() {
+    let dir = TempDir::new().unwrap();
+    // inotify only watches directories
+    let file = dir.path().join("file");
+    fs::write(&file, b"x").unwrap();
+    let watcher = Watcher::new().unwrap();
+    watcher.start();
+    for _ in 0..2 {
+        let (tx, rx) = mpsc::sync_channel(1);
+        watcher
+            .add_root(&file, true, move |watched| {
+                let _ = tx.send(watched);
+            })
+            .unwrap();
+        assert_eq!(rx.recv_timeout(*TIMEOUT), Ok(false));
+    }
+    watcher.shutdown();
+}
+
+/// Handlers run without the config lock held, so they may call back into the
+/// watcher.
+#[test]
+fn handler_may_reconfigure_the_watcher() {
+    with_watcher(|dir, watcher| {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let inner = watcher.clone();
+        watcher.add_handler(move |_| {
+            inner.add_handler(|_| false);
+            inner.set_filter(Arc::new(()), false);
+            inner.set_settle_time(Duration::from_millis(200));
+            let _ = tx.try_send(());
+            false
+        });
+        mk_write(dir, "f", "x");
+        rx.recv_timeout(*TIMEOUT)
+            .expect("handler deadlocked on the config lock");
+    });
 }

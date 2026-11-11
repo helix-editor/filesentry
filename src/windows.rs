@@ -6,12 +6,11 @@
 //! watch_subtree = TRUE, ..)` on a dedicated completion thread. Each root keeps a
 //! heap-pinned read buffer + `OVERLAPPED`; on completion we parse the
 //! `FILE_NOTIFY_INFORMATION` records and re-issue the read. It reports per-file
-//! change records, so it feeds the *precise-path* path: create/delete/rename →
-//! `NEEDS_RECURSIVE_CRAWL`, modify → empty flags. A zero-byte completion (buffer
-//! overflow) maps to a recrawl, mirroring inotify's `QUEUE_OVERFLOW`.
+//! change records, like inotify: create/delete/rename are queued with `crawl`
+//! set, modifications without. A zero-byte completion (buffer overflow) maps to a
+//! recrawl, mirroring inotify's `QUEUE_OVERFLOW`.
 
 use std::ffi::{c_void, OsStr};
-use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{self, AtomicBool};
 use std::sync::{Arc, Mutex};
 use std::{io, thread};
@@ -33,7 +32,7 @@ use windows_sys::Win32::System::IO::{
 
 use crate::backend::Backend;
 use crate::path::CanonicalPathBuf;
-use crate::pending::{self, PendingChangesLock};
+use crate::pending::PendingChangesLock;
 use crate::WatcherState;
 
 const NOTIFY_FILTER: u32 = FILE_NOTIFY_CHANGE_FILE_NAME
@@ -85,7 +84,7 @@ impl std::fmt::Debug for WindowsWatcher {
 }
 
 impl WindowsWatcher {
-    pub fn new(#[cfg(test)] _slow: bool, state: Arc<WatcherState>) -> io::Result<Arc<Self>> {
+    pub fn new(state: Arc<WatcherState>) -> io::Result<Arc<Self>> {
         let iocp = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, 0 as HANDLE, 0, 0) };
         if iocp.is_null() {
             return Err(io::Error::last_os_error());
@@ -197,10 +196,10 @@ impl WindowsWatcher {
                     | FILE_ACTION_REMOVED
                     | FILE_ACTION_RENAMED_OLD_NAME
                     | FILE_ACTION_RENAMED_NEW_NAME => {
-                        changes.add_watcher(path, pending::Flags::NEEDS_RECURSIVE_CRAWL);
+                        changes.add(path, true);
                     }
                     FILE_ACTION_MODIFIED => {
-                        changes.add_watcher(path, pending::Flags::empty());
+                        changes.add(path, false);
                     }
                     _ => {}
                 }
@@ -266,12 +265,7 @@ impl crate::backend::Backend for WindowsWatcher {
         {
             return Ok(());
         }
-        let wide: Vec<u16> = path
-            .as_std_path()
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
+        let wide = path.to_wide();
         let handle = unsafe {
             CreateFileW(
                 wide.as_ptr(),
@@ -334,14 +328,10 @@ impl crate::backend::Backend for WindowsWatcher {
             let mut roots = self.roots.lock().unwrap();
             for root in roots.iter() {
                 unsafe {
-                    // A `ReadDirectoryChangesW` may still be in flight with the kernel
-                    // holding pointers into `root.buffer`/`root.overlapped`. Cancel it and
-                    // wait before the `Box<Root>` is dropped, or the kernel could write
-                    // into freed memory. The handle is IOCP-bound, so the completion goes
-                    // to the port and the file handle is not a reliable wait object;
-                    // `GetOverlappedResult(bWait=TRUE)` waits on `root.overlapped.hEvent`
-                    // (`root.event`) instead, which the kernel signals on completion.
-                    // `CancelIoEx` returns 0 when no read is pending — nothing to wait for.
+                    // The kernel writes into `buffer`/`overlapped` until a read in
+                    // flight completes: cancel it and wait on `event` (see
+                    // `Root::event`) before the `Box<Root>` is freed. `CancelIoEx`
+                    // returns 0 when no read is pending.
                     if CancelIoEx(root.handle, &root.overlapped) != 0 {
                         let mut transferred = 0u32;
                         GetOverlappedResult(

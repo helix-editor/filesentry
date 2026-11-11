@@ -1,37 +1,34 @@
-use std::hash::{BuildHasher, Hash};
+use std::ffi::OsStr;
 use std::mem::replace;
 use std::ops::{Index, IndexMut};
 use std::time::SystemTime;
 
 use bitflags::bitflags;
 use ecow::EcoVec;
-use hashbrown::hash_table::Entry;
-use hashbrown::{DefaultHashBuilder, HashTable};
+use hashbrown::{Equivalent, HashMap};
 use walkdir::WalkDir;
 
 use crate::config::Filter;
 use crate::events::EventType;
 use crate::metadata::Metadata;
 use crate::path::CanonicalPathBuf;
-use crate::pending::{self, PendingChange, PendingChanges};
+use crate::pending::{PendingChange, PendingChanges};
+
+type Emit<'a> = &'a mut dyn FnMut(CanonicalPathBuf, EventType);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NodeMeta {
     Dir,
-    File { mtime: SystemTime, size: usize },
+    File {
+        mtime: SystemTime,
+        size: usize,
+    },
+    /// Also the state of a node that was never seen on disk yet.
     Deleted,
 }
 
 impl NodeMeta {
-    fn is_dir(&self) -> bool {
-        matches!(self, NodeMeta::Dir)
-    }
-
-    fn is_file(&self) -> bool {
-        matches!(self, NodeMeta::File { .. })
-    }
-
-    pub fn new(meta: &Metadata) -> NodeMeta {
+    fn new(meta: &Metadata) -> NodeMeta {
         if meta.is_dir {
             NodeMeta::Dir
         } else {
@@ -42,112 +39,54 @@ impl NodeMeta {
         }
     }
 
-    fn change_type(&self, new: &Self, skip_check: bool) -> Option<EventType> {
-        // we only care for changes that inolve a file, ingnore everything else
-        match (&self, &new) {
-            (
-                NodeMeta::File { mtime, size },
-                NodeMeta::File {
-                    mtime: nmtime,
-                    size: nsize,
-                },
-            ) => {
-                if !skip_check && mtime == nmtime && size == nsize {
-                    None
-                } else {
-                    Some(EventType::Modified)
-                }
-            }
-            (NodeMeta::Deleted | NodeMeta::Dir, NodeMeta::File { .. }) => Some(EventType::Create),
-            (NodeMeta::File { .. }, NodeMeta::Deleted | NodeMeta::Dir) => Some(EventType::Delete),
-            _ => None,
-        }
+    fn is_dir(&self) -> bool {
+        matches!(self, NodeMeta::Dir)
     }
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Clone, Copy, Hash, Debug)]
-pub struct DirId(u32);
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+struct DirId(u32);
 
 impl DirId {
     const NONE: DirId = DirId(u32::MAX);
 
-    pub fn is_none(self) -> bool {
-        self == Self::NONE
-    }
-
-    pub fn is_some(self) -> bool {
-        self != Self::NONE
-    }
-
-    #[inline]
-    pub fn idx(self) -> usize {
-        // A `debug_assert` let `NONE` (u32::MAX) reach `self.dirs[..]` in release,
-        // a baffling OOB far from the cause. Fail at the source; callers guard with
-        // `is_some()` first.
+    fn idx(self) -> usize {
+        // fail here rather than as a baffling out-of-bounds index in release
         assert!(
-            self.is_some(),
+            self != Self::NONE,
             "filesentry bug: DirId::NONE used as a tree index"
         );
         self.0 as usize
     }
 }
-impl From<usize> for DirId {
-    fn from(value: usize) -> Self {
-        assert!(value < Self::NONE.0 as usize);
-        DirId(value as u32)
-    }
-}
 
-#[derive(PartialEq, Eq, PartialOrd, Clone, Copy, Hash, Debug)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub struct NodeId(u32);
 
 impl NodeId {
-    const NONE: NodeId = NodeId(u32::MAX);
-
-    pub fn is_some(self) -> bool {
-        self != Self::NONE
-    }
-
-    pub fn is_none(self) -> bool {
-        self == Self::NONE
-    }
-
-    #[inline]
-    pub fn idx(self) -> usize {
-        // As `DirId::idx`: guard `NONE` in release too, not just under `debug_assert`.
-        assert!(
-            self.is_some(),
-            "filesentry bug: NodeId::NONE used as a tree index"
-        );
+    fn idx(self) -> usize {
         self.0 as usize
     }
 }
 
-impl From<usize> for NodeId {
-    fn from(value: usize) -> Self {
-        assert!(value < u32::MAX as usize);
-        NodeId(value as u32)
-    }
-}
-
-const _ASSERT: () = {
-    if size_of::<FsNode>() != 7 * 8 {
-        panic!("size of FsNode must stay constant")
-    }
-};
+const _: () = assert!(
+    size_of::<FsNode>() == 7 * 8,
+    "size of FsNode must stay constant"
+);
 
 bitflags! {
     #[derive(Clone, Copy, Debug)]
-    pub struct Flags: u32 {
-        /// temporary flag used during recursive crawls to tag which children
-        /// weren't visited yet (and mark those as deleted in the end)
+    struct Flags: u32 {
+        /// Set on a directory's children when a crawl enters it. A child that is
+        /// still marked when the crawl leaves the directory has been deleted.
         const MAYBE_DELETED = 1;
-        /// wether to watch the chidren of this node, this is always
-        /// true for recursive watches but for non recursive watches
-        /// it's only true for the top dir
+        /// Track this directory's children.
         const WATCH_CHILDREN = 0b10;
-        /// wether this node is being watched recursively
+        /// Track this directory's whole subtree.
         const RECURSIVE = 0b110;
+        /// Added as a root. It is tracked whether or not its parent is, and may have
+        /// been inserted before its parent.
+        const ROOT = 0b1000;
     }
 }
 
@@ -160,439 +99,383 @@ pub struct FsNode {
     children: DirId,
 }
 
-impl FsNode {
-    pub fn set_maybe_deleted_flag(&mut self) {
-        self.flags |= Flags::MAYBE_DELETED;
-    }
-
-    pub fn maybe_deleted_flag(&self) -> bool {
-        self.flags.contains(Flags::MAYBE_DELETED)
-    }
-
-    pub fn unset_maybe_deleted_flag(&mut self) {
-        self.flags.remove(Flags::MAYBE_DELETED)
-    }
-}
-
+/// The last known state of the watched paths. Changed paths are stat'ed again
+/// and diffed against it, which yields the file events.
 pub struct FileTree {
-    path_table: HashTable<NodeId>,
-    hasher: DefaultHashBuilder,
+    /// The keys share their buffers with the nodes' paths.
+    by_path: HashMap<CanonicalPathBuf, NodeId>,
     nodes: Vec<FsNode>,
     dirs: Vec<EcoVec<NodeId>>,
+    /// The roots to crawl on a full resync: those no other recursive root covers.
+    roots: Vec<NodeId>,
 }
 
 impl FileTree {
     pub fn new() -> Self {
         Self {
-            path_table: HashTable::with_capacity(1024),
-            hasher: DefaultHashBuilder::default(),
+            by_path: HashMap::with_capacity(1024),
             nodes: Vec::with_capacity(1024),
             dirs: Vec::with_capacity(128),
+            roots: Vec::new(),
         }
     }
 
-    pub fn apply_transaction(
+    fn find(&self, path: &OsStr) -> Option<NodeId> {
+        self.by_path.get(path).copied()
+    }
+
+    /// Adds a `Deleted` node for `path`, for `update` to fill in.
+    fn insert(&mut self, path: CanonicalPathBuf, parent: Option<NodeId>, flags: Flags) -> NodeId {
+        let id = NodeId(u32::try_from(self.nodes.len()).expect("too many nodes"));
+        self.nodes.push(FsNode {
+            path,
+            meta: NodeMeta::Deleted,
+            inode: 0,
+            flags,
+            children: DirId::NONE,
+        });
+        self.by_path.insert(self.nodes[id.idx()].path.clone(), id);
+        if let Some(parent) = parent {
+            self.add_child(parent, id);
+        }
+        id
+    }
+
+    fn add_child(&mut self, dir: NodeId, child: NodeId) {
+        if self[dir].children == DirId::NONE {
+            self[dir].children = DirId(self.dirs.len() as u32);
+            self.dirs.push(EcoVec::new());
+        }
+        let children = self[dir].children;
+        self.dirs[children.idx()].push(child);
+    }
+
+    /// A cheap copy, so the tree can be modified while iterating.
+    fn children(&self, dir: NodeId) -> EcoVec<NodeId> {
+        match self[dir].children {
+            DirId::NONE => EcoVec::new(),
+            children => self.dirs[children.idx()].clone(),
+        }
+    }
+
+    /// Starts tracking the directory `path`, or returns `None` if it already is.
+    /// The caller then crawls the returned root.
+    pub fn add_root(&mut self, path: CanonicalPathBuf, recursive: bool) -> Option<NodeId> {
+        let watch = if recursive {
+            Flags::RECURSIVE
+        } else {
+            Flags::WATCH_CHILDREN
+        };
+        if let Some(id) = self.find(path.as_os_str()) {
+            if self[id].meta == NodeMeta::Deleted {
+                // The directory was deleted and recreated, and its own event hasn't
+                // arrived yet. The node is stale, so track it again.
+                let meta = Metadata::for_path(&path)?;
+                self.update(id, Some(&meta), false, &mut |_, _| {});
+                self[id].flags |= watch | Flags::ROOT;
+                return Some(id);
+            }
+            let node = &mut self[id];
+            if !node.meta.is_dir() || node.flags.contains(watch) {
+                return None;
+            }
+            node.flags |= watch | Flags::ROOT;
+            return Some(id);
+        }
+        let meta = Metadata::for_path(&path)?;
+        let parent = path.parent().and_then(|p| self.find(p.as_os_str()));
+        let id = self.insert(path, parent, watch | Flags::ROOT);
+        self.update(id, Some(&meta), false, &mut |_, _| {});
+        Some(id)
+    }
+
+    /// Starts tracking `path` and crawls it, unless it already is tracked.
+    pub fn track_root(
         &mut self,
-        transaction: &mut PendingChanges,
+        path: CanonicalPathBuf,
+        recursive: bool,
         filter: &dyn Filter,
-        mut emit_event: impl FnMut(CanonicalPathBuf, EventType),
-        work_stack: &mut Vec<(NodeId, usize)>,
+        emit: impl FnMut(CanonicalPathBuf, EventType),
+        add_watch: impl FnMut(CanonicalPathBuf),
+    ) {
+        let Some(node) = self.add_root(path.clone(), recursive) else {
+            return;
+        };
+        self.crawl(node, true, filter, emit, add_watch);
+        if recursive {
+            // the new root's crawl covers the roots inside it, unless they are in an
+            // ignored directory
+            let nodes = &self.nodes;
+            self.roots.retain(|&r| {
+                let inner = &nodes[r.idx()].path;
+                !path.is_parent_of(inner) || filter.ignore_path_rec(inner.as_std_path(), Some(true))
+            });
+        }
+        if !self.roots.contains(&node) {
+            self.roots.push(node);
+        }
+    }
+
+    /// Re-syncs every root with the disk, for when the backend lost track of
+    /// what changed.
+    pub fn recrawl(
+        &mut self,
+        filter: &dyn Filter,
+        mut emit: impl FnMut(CanonicalPathBuf, EventType),
         mut add_watch: impl FnMut(CanonicalPathBuf),
     ) {
-        let mut transaction = transaction.drain().peekable();
-        while let Some(change) = transaction.next() {
-            let (node, recurse) = self.apply_change(&change, work_stack, &mut emit_event);
-            if recurse {
-                if node.is_some()
-                    && self[node].meta.is_dir()
-                    // double check that this path is not ignored before dowing an expensive crawl
-                    && !filter.ignore_path(change.path.as_std_path(), Some(true))
+        for i in 0..self.roots.len() {
+            self.crawl_impl(self.roots[i], false, filter, &mut emit, &mut add_watch);
+        }
+    }
+
+    /// Applies a batch of changes reported by the backend.
+    pub fn apply_transaction(
+        &mut self,
+        changes: &mut PendingChanges,
+        filter: &dyn Filter,
+        mut emit: impl FnMut(CanonicalPathBuf, EventType),
+        mut add_watch: impl FnMut(CanonicalPathBuf),
+    ) {
+        let mut changes = changes.drain().peekable();
+        while let Some(change) = changes.next() {
+            if self.apply_change(&change, filter, &mut emit, &mut add_watch) {
+                while let Some(next) = changes.next_if(|next| change.path.is_parent_of(&next.path))
                 {
-                    self.crawl(node, filter, work_stack, &mut emit_event, &mut add_watch);
+                    // Crawls compare metadata; a precise notification still matters when
+                    // the bytes changed without a new size, inode or timestamp.
+                    if !next.crawl {
+                        self.apply_change(&next, filter, &mut emit, &mut add_watch);
+                    }
                 }
-                // skip any pending changes for child directories
-                while transaction
-                    .next_if(|next_change| change.path.is_parent_of(&next_change.path))
-                    .is_some()
-                {}
             }
         }
     }
 
-    fn reserve_dir(&mut self, node: NodeId, size: usize) -> DirId {
-        let dir = self.dirs.len().into();
-        self[node].children = dir;
-        self.dirs.push(EcoVec::with_capacity(size));
-        dir
-    }
-
-    fn add_child(&mut self, node: NodeId, child: NodeId) {
-        let dir = if self[node].children.is_none() {
-            self.reserve_dir(node, 4)
-        } else {
-            self[node].children
-        };
-        self.dirs[dir.idx()].push(child);
-    }
-
-    /// Applies a change to the in-memory file tree
-    pub fn apply_change(
+    /// Re-stats a changed path. Returns true if that also covered everything below
+    /// it, because the path was crawled or deleted, or isn't tracked.
+    fn apply_change(
         &mut self,
         change: &PendingChange,
-        work_stack: &mut Vec<(NodeId, usize)>,
-        mut emit_event: impl FnMut(CanonicalPathBuf, EventType),
-    ) -> (NodeId, bool) {
-        let fs_meta = Metadata::for_path(&change.path);
-
-        let hash = self.hasher.hash_one(&change.path);
-        let entry = self.path_table.entry(
-            hash,
-            |&tree_id| self.nodes[tree_id.idx()].path == change.path,
-            |id| self.hasher.hash_one(&self.nodes[id.idx()].path),
-        );
-        // A NEEDS_NON_RECURSIVE_CRAWL change (FSEvents reports *that* a directory changed,
-        // not *what*) must also trigger a (re)crawl of that directory -- otherwise the change
-        // inside it is never detected. The crawl's depth is still decided by the node's own
-        // RECURSIVE flag. (inotify never sets this flag, so the Linux path is unaffected.)
-        let mut recursive = change.flags.intersects(
-            pending::Flags::NEEDS_RECURSIVE_CRAWL | pending::Flags::NEEDS_NON_RECURSIVE_CRAWL,
-        );
-        let mark_recursive = change.flags.contains(pending::Flags::MARK_RECURSIVE);
-        match entry {
-            Entry::Occupied(entry) => {
-                let id = *entry.get();
-                let node = &mut self.nodes[id.idx()];
-                if mark_recursive {
-                    node.flags |= Flags::RECURSIVE
-                }
-                if let Some(fs_meta) = fs_meta {
-                    let meta = NodeMeta::new(&fs_meta);
-                    let inode_changed = fs_meta.inode != node.inode;
-                    // If the inode number changed then we definitely need to recursively
-                    // examine any children because we cannot assume that the kernel will
-                    // have given us the correct hints about this change.  BTRFS is one
-                    // example of a filesystem where this has been observed to happen.
-                    recursive |= inode_changed;
-                    node.inode = fs_meta.inode;
-                    let changed = node.meta.change_type(
-                        &meta,
-                        inode_changed | change.flags.contains(pending::Flags::ORIGIN_WATCHER),
-                    );
-                    if let Some(changed) = changed {
-                        emit_event(change.path.clone(), changed);
-                        recursive |= changed == EventType::Create;
-                    }
-                    node.meta = meta;
-                    let watch_children = node.flags.contains(Flags::WATCH_CHILDREN);
-                    if fs_meta.is_dir
-                        && node.children.is_none()
-                        && fs_meta.size != 0
-                        && watch_children
-                    {
-                        self.reserve_dir(id, fs_meta.size);
-                    }
-                    (id, recursive && watch_children)
-                } else {
-                    let old_meta = replace(&mut node.meta, NodeMeta::Deleted);
-                    match old_meta {
-                        NodeMeta::Dir => self.delete_rec(id, work_stack, &mut emit_event),
-                        NodeMeta::File { .. } => emit_event(change.path.clone(), EventType::Delete),
-                        NodeMeta::Deleted => (),
-                    }
-                    (id, true)
-                }
+        filter: &dyn Filter,
+        emit: Emit,
+        add_watch: &mut dyn FnMut(CanonicalPathBuf),
+    ) -> bool {
+        let meta = Metadata::for_path(&change.path);
+        let found = self.find(change.path.as_os_str());
+        let id = match found {
+            Some(id)
+                if self[id].meta != NodeMeta::Deleted || self[id].flags.contains(Flags::ROOT) =>
+            {
+                id
             }
-            Entry::Vacant(entry) => {
-                let Some(fs_meta) = fs_meta else {
-                    return (NodeId::NONE, true);
+            _ => {
+                // Backends report paths the tree doesn't track, for example through
+                // a watch that outlived a filter change. Only a live directory that
+                // tracks its children can start tracking a new entry.
+                let Some(meta) = &meta else {
+                    return true;
                 };
-                let meta = NodeMeta::new(&fs_meta);
-                let id = NodeId::from(self.nodes.len());
-                entry.insert(id);
-                let parent = change.path.parent().and_then(|parent| {
-                    let hash = self.hasher.hash_one(parent.as_os_str());
-                    self.path_table
-                        .find(hash, |&id| self.nodes[id.idx()].path == parent)
-                        .copied()
-                });
-                let Some(parent) = parent else {
-                    log::error!("for {change:?} the parent wasn't yet in the tree! Ignoring...");
-                    // remove inserted entry again as insertion failed
-                    self.path_table
-                        .find_entry(hash, |&tree_id| tree_id == id)
-                        .unwrap()
-                        .remove();
-                    return (NodeId::NONE, true);
+                let parent = change.path.parent().and_then(|p| self.find(p.as_os_str()));
+                let Some(parent) = parent.filter(|&p| {
+                    self[p].meta.is_dir() && self[p].flags.contains(Flags::WATCH_CHILDREN)
+                }) else {
+                    return true;
                 };
-                self.add_child(parent, id);
-                recursive = mark_recursive || self[parent].flags.contains(Flags::RECURSIVE);
-                let flags = if recursive {
-                    Flags::RECURSIVE
-                } else {
-                    Flags::empty()
-                };
-                self.nodes.push(FsNode {
-                    path: change.path.clone(),
-                    meta,
-                    flags,
-                    inode: fs_meta.inode,
-                    children: DirId::NONE,
-                });
-                if !fs_meta.is_dir {
-                    emit_event(change.path.clone(), EventType::Create)
-                } else if recursive && fs_meta.size != 0 {
-                    self.reserve_dir(id, fs_meta.size);
+                if filter.ignore_path(change.path.as_std_path(), Some(meta.is_dir)) {
+                    return true;
                 }
-                (id, recursive)
-            }
-        }
-    }
-
-    pub fn add_root(&mut self, root: CanonicalPathBuf, recursive: bool) -> Option<NodeId> {
-        self.add(root, recursive, true)
-    }
-
-    fn add(&mut self, path: CanonicalPathBuf, recursive: bool, root: bool) -> Option<NodeId> {
-        let hash = self.hasher.hash_one(&path);
-        let entry = self.path_table.entry(
-            hash,
-            |&tree_id| self.nodes[tree_id.idx()].path == path,
-            |id| self.hasher.hash_one(&self.nodes[id.idx()].path),
-        );
-        match entry {
-            Entry::Occupied(entry) => {
-                // we only want to add new entries here but if we are a recursive watch
-                // and the target is not being recursively watched then we still have to add it
-                if !recursive {
-                    log::error!("already watching {path:?}");
-                    return None;
-                }
-                let id = *entry.get();
-                // also roots can only be dirs, not files
-                if root && !self[id].meta.is_dir() {
-                    log::error!("invalid root {path:?}: not a directory");
-                    return None;
-                }
-                if self[id].flags.contains(Flags::RECURSIVE) {
-                    log::error!("already watching recursively {path:?}");
-                    return None;
-                }
-                self[id].flags.insert(Flags::RECURSIVE);
-                Some(id)
-            }
-            Entry::Vacant(entry) => {
-                let fs_meta = Metadata::for_path(&path)?;
-                let meta = NodeMeta::new(&fs_meta);
-                let id = NodeId::from(self.nodes.len());
-                entry.insert(id);
-                let parent = path.parent().and_then(|parent| {
-                    let hash = self.hasher.hash_one(parent.as_os_str());
-                    self.path_table
-                        .find(hash, |&id| self.nodes[id.idx()].path == parent)
-                        .copied()
-                });
-                if let Some(parent) = parent {
-                    self.add_child(parent, id);
-                } else if !root {
-                    log::error!("for {path:?} the parent wasn't yet in the tree! Ignoring...");
-                    // Use id comparison instead of accessing self.nodes since the node
-                    // hasn't been added yet (would cause index out of bounds)
-                    self.path_table
-                        .find_entry(hash, |&tree_id| tree_id == id)
-                        .unwrap()
-                        .remove();
-                    return None;
-                };
-                self.nodes.push(FsNode {
-                    path: path.clone(),
-                    meta,
-                    inode: fs_meta.inode,
-                    children: DirId::NONE,
-                    flags: if recursive {
+                found.unwrap_or_else(|| {
+                    let recursive = self[parent].flags.contains(Flags::RECURSIVE);
+                    let flags = if recursive {
                         Flags::RECURSIVE
-                    } else if root {
-                        Flags::WATCH_CHILDREN
                     } else {
                         Flags::empty()
-                    },
-                });
-                if fs_meta.is_dir && (recursive || root) && fs_meta.size != 0 {
-                    self.reserve_dir(id, fs_meta.size);
+                    };
+                    self.insert(change.path.clone(), Some(parent), flags)
+                })
+            }
+        };
+        let crawl = self.update(id, meta.as_ref(), true, emit) || change.crawl;
+        let node = &self[id];
+        match node.meta {
+            NodeMeta::Deleted => true,
+            NodeMeta::Dir if crawl && node.flags.contains(Flags::WATCH_CHILDREN) => {
+                if !filter.ignore_path(change.path.as_std_path(), Some(true)) {
+                    self.crawl_impl(id, false, filter, emit, add_watch);
                 }
-                Some(id)
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Records `meta`, a fresh stat or `None` if the path is gone, for `id` and
+    /// emits the matching file event. When `precise` is set the backend reported
+    /// this path, so a file that looks unchanged is still `Modified`. Returns
+    /// whether the node is a directory whose contents need a crawl.
+    fn update(&mut self, id: NodeId, meta: Option<&Metadata>, precise: bool, emit: Emit) -> bool {
+        let Some(meta) = meta else {
+            self.delete(id, emit);
+            return false;
+        };
+        let new = NodeMeta::new(meta);
+        let node = &self[id];
+        let was_dir = node.meta.is_dir();
+        // A changed inode means a replaced path, whose contents the backend may
+        // not have reported (seen on BTRFS).
+        let inode_changed = node.inode != meta.inode;
+        let event = match (&node.meta, &new) {
+            (NodeMeta::File { .. }, NodeMeta::File { .. }) => {
+                (precise || inode_changed || node.meta != new).then_some(EventType::Modified)
+            }
+            (_, NodeMeta::File { .. }) => Some(EventType::Create),
+            (NodeMeta::File { .. }, _) => Some(EventType::Delete),
+            _ => None,
+        };
+        if was_dir && !meta.is_dir {
+            self.delete(id, emit);
+        }
+        let node = &mut self[id];
+        node.meta = new;
+        node.inode = meta.inode;
+        if let Some(event) = event {
+            emit(node.path.clone(), event);
+        }
+        meta.is_dir && (inode_changed || !was_dir)
+    }
+
+    /// Marks `id` and everything below it deleted, emitting a `Delete` per file.
+    fn delete(&mut self, id: NodeId, emit: Emit) {
+        let mut stack = vec![id];
+        while let Some(id) = stack.pop() {
+            let node = &mut self.nodes[id.idx()];
+            match replace(&mut node.meta, NodeMeta::Deleted) {
+                NodeMeta::File { .. } => emit(node.path.clone(), EventType::Delete),
+                NodeMeta::Dir if node.children != DirId::NONE => {
+                    stack.extend_from_slice(&self.dirs[node.children.idx()])
+                }
+                _ => (),
             }
         }
     }
 
-    /// recursively marks any children of the give filesystem node
-    /// as deleted
-    fn delete_rec(
-        &mut self,
-        id: NodeId,
-        work_stack: &mut Vec<(NodeId, usize)>,
-        mut emit_event: impl FnMut(CanonicalPathBuf, EventType),
-    ) {
-        if self[id].children.is_none() {
-            return;
-        }
-        self[id].meta = NodeMeta::Deleted;
-        let start_len = work_stack.len();
-        work_stack.push((id, 0));
-        while work_stack.len() > start_len {
-            let (id, child) = work_stack.last_mut().unwrap();
-            let Some(&child_id) = self[self[*id].children].get(*child) else {
-                self[*id].meta = NodeMeta::Deleted;
-                work_stack.pop();
-                continue;
-            };
-            *child += 1;
-            if self[child_id].meta.is_file() {
-                emit_event(self[child_id].path.clone(), EventType::Delete);
-            } else if self[child_id].meta.is_dir() && self[child_id].children.is_some() {
-                work_stack.push((child_id, 0));
-            }
-            self[child_id].meta = NodeMeta::Deleted
-        }
-    }
-
-    // (recursively) crawl a directory to re-synchronize the file tree
-    // and record any changes observed along the way
+    /// Re-syncs the contents of `root` (its whole subtree if it is recursive)
+    /// with the disk. `initial` silences the `Create`s for paths the tree has
+    /// never seen: a new root's contents aren't news.
     pub fn crawl(
         &mut self,
         root: NodeId,
+        initial: bool,
         filter: &dyn Filter,
-        work_stack: &mut Vec<(NodeId, usize)>,
-        mut emit_event: impl FnMut(CanonicalPathBuf, EventType),
+        mut emit: impl FnMut(CanonicalPathBuf, EventType),
         mut add_watch: impl FnMut(CanonicalPathBuf),
     ) {
-        let mut walk_builder = WalkDir::new(self[root].path.as_std_path())
-            .follow_links(false)
-            .follow_root_links(false)
-            .same_file_system(true);
-        let recursive = self[root].flags.contains(Flags::RECURSIVE);
-        let flags = if recursive {
-            pending::Flags::NEEDS_RECURSIVE_CRAWL | pending::Flags::MARK_RECURSIVE
-        } else {
-            walk_builder = walk_builder.max_depth(1);
-            pending::Flags::NEEDS_RECURSIVE_CRAWL
-        };
-        add_watch(self[root].path.clone());
-        if self[root].children.is_some() {
-            for &child in &self.dirs[self[root].children.idx()] {
-                self.nodes[child.idx()].set_maybe_deleted_flag();
-            }
-            work_stack.push((root, 0));
-        }
-
-        let mut walk = walk_builder.into_iter();
-        while let Some(child) = walk.next() {
-            let Ok(child) = child else {
-                // TODO: why can this fail? permission issue?
-                // how to handle that? just ignore?
-                continue;
-            };
-            // the root was already analyzed by the caller don't restart it
-            if child.depth() == 0 {
-                continue;
-            }
-            if filter.ignore_path(child.path(), Some(child.file_type().is_dir())) {
-                if child.file_type().is_dir() {
-                    walk.skip_current_dir()
-                }
-                continue;
-            }
-            let path = CanonicalPathBuf::assert_canonicalized(child.path());
-            let change = PendingChange { path, flags };
-            let (node, _) = self.apply_change(&change, work_stack, &mut emit_event);
-
-            // apply_change can return NodeId::NONE if the path doesn't exist
-            // (e.g., deleted between walkdir iteration and stat)
-            if node.is_none() {
-                continue;
-            }
-            self[node].unset_maybe_deleted_flag();
-            while work_stack
-                .last()
-                .is_some_and(|(_, depth)| *depth >= child.depth())
-            {
-                let (node, _) = work_stack.pop().unwrap();
-                for &child in &self.dirs[self[node].children.idx()].clone() {
-                    if self.nodes[child.idx()].maybe_deleted_flag() {
-                        // Only files generate events (mirrors `apply_change`'s delete
-                        // branch and `delete_rec`); a vanished directory surfaces as the
-                        // deletion of the files it contained, not a delete of itself.
-                        if self[child].meta.is_file() {
-                            emit_event(self[child].path.clone(), EventType::Delete);
-                        }
-                        self.delete_rec(child, work_stack, &mut emit_event);
-                    }
-                }
-            }
-            if self[node].meta.is_dir() && recursive {
-                add_watch(change.path.clone());
-                // track which directories we are entering/exiting so that we can mark any
-                // files that were not visited as removed
-                if self[node].children.is_some() {
-                    for &child in &self.dirs[self[node].children.idx()] {
-                        self.nodes[child.idx()].set_maybe_deleted_flag();
-                    }
-                    work_stack.push((node, child.depth()));
-                }
-            }
-        }
-        while let Some((node, _)) = work_stack.pop() {
-            for &child in &self.dirs[self[node].children.idx()].clone() {
-                if self.nodes[child.idx()].maybe_deleted_flag() {
-                    // see the matching loop above: directories don't emit their own
-                    // delete, only the files underneath them do.
-                    if self[child].meta.is_file() {
-                        emit_event(self[child].path.clone(), EventType::Delete);
-                    }
-                    self.delete_rec(child, work_stack, &mut emit_event);
-                }
-            }
-        }
+        self.crawl_impl(root, initial, filter, &mut emit, &mut add_watch)
     }
 
-    pub fn crawl_root(
+    fn crawl_impl(
         &mut self,
         root: NodeId,
-        recursive: bool,
+        initial: bool,
         filter: &dyn Filter,
-        mut add_watch: impl FnMut(CanonicalPathBuf),
+        emit: Emit,
+        add_watch: &mut dyn FnMut(CanonicalPathBuf),
     ) {
+        let recursive = self[root].flags.contains(Flags::RECURSIVE);
         let mut walk = WalkDir::new(self[root].path.as_std_path())
+            .min_depth(1)
             .follow_links(false)
             .follow_root_links(false)
             .same_file_system(true);
         if !recursive {
             walk = walk.max_depth(1);
         }
+        add_watch(self[root].path.clone());
+        // the directories the walk is in, with their depth
+        let mut open = vec![(root, 0)];
+        self.mark_children(root);
         let mut walk = walk.into_iter();
-        while let Some(child) = walk.next() {
-            let Ok(child) = child else {
-                // TODO: why can this fail? permission issue?
-                // how to handle that? just ignore?
+        while let Some(entry) = walk.next() {
+            // TODO: unreadable entries are skipped silently
+            let Ok(entry) = entry else {
                 continue;
             };
-            if child.depth() == 0 {
-                continue;
+            while open
+                .last()
+                .is_some_and(|&(_, depth)| depth >= entry.depth())
+            {
+                let (dir, _) = open.pop().unwrap();
+                self.sweep_children(dir, emit);
             }
-            if filter.ignore_path(child.path(), Some(child.file_type().is_dir())) {
-                if child.file_type().is_dir() {
-                    walk.skip_current_dir()
+            let is_dir = entry.file_type().is_dir();
+            if filter.ignore_path(entry.path(), Some(is_dir)) {
+                if is_dir {
+                    walk.skip_current_dir();
                 }
                 continue;
             }
-            let path = CanonicalPathBuf::assert_canonicalized(child.path());
-            if let Some(node) = self.add(path.clone(), recursive, false) {
-                if self[node].meta.is_dir() && recursive {
-                    add_watch(self[node].path.clone())
+            let parent = open.last().unwrap().0;
+            let path = CanonicalPathBuf::assert_canonicalized(entry.path());
+            let meta = Metadata::for_path(&path);
+            let id = match self.find(path.as_os_str()) {
+                Some(id) => {
+                    if self[id].flags.contains(Flags::ROOT) && !self.children(parent).contains(&id)
+                    {
+                        self.add_child(parent, id);
+                    }
+                    self[id].flags.remove(Flags::MAYBE_DELETED);
+                    self.update(id, meta.as_ref(), false, emit);
+                    id
                 }
-            } else {
-                walk.skip_current_dir()
+                // vanished since the readdir, or a symlink
+                None if meta.is_none() => continue,
+                None => {
+                    let id = self.insert(path.clone(), Some(parent), Flags::empty());
+                    let sink: Emit = if initial { &mut |_, _| {} } else { &mut *emit };
+                    self.update(id, meta.as_ref(), false, sink);
+                    id
+                }
+            };
+            if recursive {
+                self[id].flags |= Flags::RECURSIVE;
+            }
+            // Only descend into directories pushed on `open`, so that its top stays
+            // the parent of the next entry.
+            if recursive && self[id].meta.is_dir() {
+                add_watch(path);
+                self.mark_children(id);
+                open.push((id, entry.depth()));
+            } else if is_dir {
+                walk.skip_current_dir();
             }
         }
+        while let Some((dir, _)) = open.pop() {
+            self.sweep_children(dir, emit);
+        }
+    }
+
+    fn mark_children(&mut self, dir: NodeId) {
+        for &child in &self.children(dir) {
+            self[child].flags |= Flags::MAYBE_DELETED;
+        }
+    }
+
+    /// Deletes the children of `dir` the walk didn't come across.
+    fn sweep_children(&mut self, dir: NodeId, emit: Emit) {
+        for &child in &self.children(dir) {
+            if self[child].flags.contains(Flags::MAYBE_DELETED) {
+                self[child].flags.remove(Flags::MAYBE_DELETED);
+                self.delete(child, emit);
+            }
+        }
+    }
+}
+
+/// Lets `by_path` be queried with a borrowed path, which hashes the same bytes.
+impl Equivalent<CanonicalPathBuf> for OsStr {
+    fn equivalent(&self, key: &CanonicalPathBuf) -> bool {
+        key.as_os_str() == self
     }
 }
 
@@ -610,142 +493,130 @@ impl IndexMut<NodeId> for FileTree {
     }
 }
 
-impl Index<DirId> for FileTree {
-    type Output = EcoVec<NodeId>;
-
-    fn index(&self, index: DirId) -> &Self::Output {
-        &self.dirs[index.idx()]
-    }
-}
-
-impl IndexMut<DirId> for FileTree {
-    fn index_mut(&mut self, index: DirId) -> &mut Self::Output {
-        &mut self.dirs[index.idx()]
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{DirId, NodeId};
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
-    /// FSEvents reports "directory X changed" via `NEEDS_NON_RECURSIVE_CRAWL`; the tree must
-    /// re-crawl X and surface the change inside it. This flag used to be emitted but never
-    /// consumed, so macOS detected no in-directory changes at all.
-    #[test]
-    fn non_recursive_crawl_detects_inner_change() {
-        use super::FileTree;
-        use crate::events::EventType;
-        use crate::path::CanonicalPathBuf;
-        use crate::pending::{Flags, PendingChanges};
-        use std::fs;
+    use super::{FileTree, NodeId};
+    use crate::config::Filter;
+    use crate::events::EventType;
+    use crate::path::CanonicalPathBuf;
+    use crate::pending::PendingChanges;
 
+    type Events = Vec<(CanonicalPathBuf, EventType)>;
+
+    fn canon(path: &Path) -> CanonicalPathBuf {
+        CanonicalPathBuf::assert_canonicalized(path)
+    }
+
+    /// A temporary directory and its canonical path, which is what the tree
+    /// reports (macOS `/var` is `/private/var`, Windows paths get a `\\?\` prefix).
+    fn tempdir() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        // Canonicalize so the path is already in `CanonicalPathBuf` form: on Windows a
-        // bare `C:\..` temp path (no leading separator) would be mangled by `push`,
-        // and on macOS `/var` resolves to `/private/var`. Derive children from it so
-        // they match the crawl-built tree nodes byte-for-byte.
-        let root_path = dir.path().canonicalize().unwrap();
-        let sub = root_path.join("sub");
-        fs::create_dir(&sub).unwrap();
-        let file = sub.join("f");
-        fs::write(&file, b"v1").unwrap();
+        let path = dir.path().canonicalize().unwrap();
+        (dir, path)
+    }
 
+    fn watch(root: &Path, recursive: bool) -> (FileTree, NodeId) {
         let mut tree = FileTree::new();
-        let root = tree
-            .add_root(CanonicalPathBuf::assert_canonicalized(&root_path), true)
-            .unwrap();
-        tree.crawl_root(root, true, &(), |_| {});
+        let id = tree.add_root(canon(root), recursive).unwrap();
+        tree.crawl(id, true, &(), |_, _| {}, |_| {});
+        (tree, id)
+    }
 
-        // Change the file so a re-crawl of `sub` would notice it (different size/mtime).
-        fs::write(&file, b"v2 is longer").unwrap();
-
-        let mut changes = PendingChanges::default();
-        changes.add_watcher(
-            CanonicalPathBuf::assert_canonicalized(&sub),
-            Flags::NEEDS_NON_RECURSIVE_CRAWL,
-        );
+    fn crawl(tree: &mut FileTree, root: NodeId, filter: &dyn Filter) -> Events {
         let mut events = Vec::new();
-        let mut work_stack = Vec::new();
-        tree.apply_transaction(
-            &mut changes,
-            &(),
-            |path, ty| events.push((path, ty)),
-            &mut work_stack,
-            |_| {},
-        );
+        tree.crawl(root, false, filter, |p, ty| events.push((p, ty)), |_| {});
+        events
+    }
+
+    /// Applies one batch of backend notifications, given as `(path, crawl)` pairs.
+    fn apply(tree: &mut FileTree, filter: &dyn Filter, changes: &[(&Path, bool)]) -> Events {
+        let mut pending = PendingChanges::default();
+        for &(path, crawl) in changes {
+            pending.add(canon(path), crawl);
+        }
+        let mut events = Vec::new();
+        tree.apply_transaction(&mut pending, filter, |p, ty| events.push((p, ty)), |_| {});
+        events
+    }
+
+    fn has(events: &Events, ty: EventType, path: &Path) -> bool {
+        events.iter().any(|(p, t)| *t == ty && *p == path)
+    }
+
+    /// A directory that was deleted and recreated stays a stale node until its own
+    /// event arrives. Adding it as a root must still track it.
+    #[test]
+    fn add_root_on_recreated_dir() {
+        let (_dir, root) = tempdir();
+        let d = root.join("d");
+        fs::create_dir(&d).unwrap();
+        let (mut tree, id) = watch(&root, true);
+        fs::remove_dir(&d).unwrap();
+        crawl(&mut tree, id, &());
+        fs::create_dir(&d).unwrap();
+        let inner = tree.add_root(canon(&d), true).expect("root not added");
+        fs::write(d.join("f"), b"x").unwrap();
+        let events = crawl(&mut tree, inner, &());
+        assert!(has(&events, EventType::Create, &d.join("f")), "{events:?}");
+    }
+
+    /// A directory renamed away and back keeps its inode and gets no create
+    /// event, but its node must still be crawled again.
+    #[test]
+    fn directory_renamed_back_is_recrawled() {
+        let (_dir, root) = tempdir();
+        let (d, x) = (root.join("d"), root.join("x"));
+        fs::create_dir(&d).unwrap();
+        fs::write(d.join("f"), b"v1").unwrap();
+        let (mut tree, _) = watch(&root, true);
+        fs::rename(&d, &x).unwrap();
+        apply(&mut tree, &(), &[(&d, false), (&x, false)]);
+        fs::rename(&x, &d).unwrap();
+        let events = apply(&mut tree, &(), &[(&x, false), (&d, false)]);
+        assert!(has(&events, EventType::Create, &d.join("f")), "{events:?}");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod sweep;
+
+#[cfg(test)]
+mod precise_notifications {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn ancestor_crawl_must_not_erase_precise_file_notification() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let file = root.join("f");
+        fs::write(&file, b"old").unwrap();
+        let mtime = fs::metadata(&file).unwrap().modified().unwrap();
+        let mut tree = FileTree::new();
+        let root_id = tree
+            .add_root(CanonicalPathBuf::assert_canonicalized(&root), true)
+            .unwrap();
+        tree.crawl(root_id, true, &(), |_, _| {}, |_| {});
+        fs::write(&file, b"new").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let mut changes = PendingChanges::default();
+        changes.add(CanonicalPathBuf::assert_canonicalized(&root), true);
+        changes.add(CanonicalPathBuf::assert_canonicalized(&file), false);
+        let mut events = Vec::new();
+        tree.apply_transaction(&mut changes, &(), |p, t| events.push((p, t)), |_| {});
         assert!(
             events
                 .iter()
-                .any(|(p, ty)| *ty == EventType::Modified && p.as_std_path().ends_with("f")),
-            "expected a Modified event for the inner file, got {events:?}",
+                .any(|(p, t)| *p == file && *t == EventType::Modified),
+            "{events:?}"
         );
-    }
-
-    /// A directory that vanished between crawls must surface as deletes of the
-    /// files it contained -- never a delete of the directory itself (only files
-    /// generate events). Exercised here cross-platform; on macOS the same crawl
-    /// path is what the `delete` integration test hits.
-    #[test]
-    fn crawl_deleted_dir_emits_only_inner_file_delete() {
-        use super::FileTree;
-        use crate::events::EventType;
-        use crate::path::CanonicalPathBuf;
-        use std::fs;
-
-        let dir = tempfile::tempdir().unwrap();
-        // Canonicalize the root (see `non_recursive_crawl_detects_inner_change`): a bare
-        // Windows `C:\..` path isn't in `CanonicalPathBuf` form and would be mangled.
-        let root_path = dir.path().canonicalize().unwrap();
-        let bar = root_path.join("bar");
-        fs::create_dir(&bar).unwrap();
-        fs::write(bar.join("baz"), b"v1").unwrap();
-
-        let mut tree = FileTree::new();
-        let root = tree
-            .add_root(CanonicalPathBuf::assert_canonicalized(&root_path), true)
-            .unwrap();
-        let mut work_stack = Vec::new();
-        tree.crawl_root(root, true, &(), |_| {});
-
-        fs::remove_file(bar.join("baz")).unwrap();
-        fs::remove_dir(&bar).unwrap();
-
-        let mut events = Vec::new();
-        tree.crawl(
-            root,
-            &(),
-            &mut work_stack,
-            |path, ty| events.push((path, ty)),
-            |_| {},
-        );
-
-        assert_eq!(
-            events.len(),
-            1,
-            "expected only the inner file delete, got {events:?}"
-        );
-        assert_eq!(events[0].1, EventType::Delete);
-        assert!(
-            events[0].0.as_std_path().ends_with("baz"),
-            "expected the file delete, got {events:?}",
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "NodeId::NONE used as a tree index")]
-    fn node_none_index_panics_clearly() {
-        let _ = NodeId::NONE.idx();
-    }
-
-    #[test]
-    #[should_panic(expected = "DirId::NONE used as a tree index")]
-    fn dir_none_index_panics_clearly() {
-        let _ = DirId::NONE.idx();
-    }
-
-    #[test]
-    fn valid_ids_index_normally() {
-        assert_eq!(NodeId::from(7usize).idx(), 7);
-        assert_eq!(DirId::from(3usize).idx(), 3);
     }
 }

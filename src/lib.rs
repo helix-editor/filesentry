@@ -1,7 +1,5 @@
 use std::io;
 use std::path::Path;
-#[cfg(all(test, not(watcher_disable)))]
-use std::sync::atomic::AtomicUsize;
 #[cfg(not(watcher_disable))]
 use std::sync::atomic::{self, AtomicBool};
 #[cfg(not(watcher_disable))]
@@ -51,16 +49,9 @@ struct AddRoot {
 }
 
 #[cfg(not(watcher_disable))]
-#[derive(Default)]
-struct Notifications {
-    /// new roots to be added to the watcher
-    roots: Vec<AddRoot>,
-}
-
-#[cfg(not(watcher_disable))]
-impl std::fmt::Debug for Notifications {
+impl std::fmt::Debug for AddRoot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Notifications").finish_non_exhaustive()
+        f.debug_struct("AddRoot").field("path", &self.path).finish()
     }
 }
 
@@ -68,10 +59,10 @@ impl std::fmt::Debug for Notifications {
 #[derive(Debug)]
 struct WatcherState {
     config: Mutex<Config>,
-    notifications: Mutex<Notifications>,
-    has_notifications: AtomicBool,
-    #[cfg(test)]
-    recrawls: AtomicUsize,
+    /// roots for the worker to add
+    new_roots: Mutex<Vec<AddRoot>>,
+    has_new_roots: AtomicBool,
+    started: AtomicBool,
 }
 
 #[cfg(not(watcher_disable))]
@@ -113,11 +104,6 @@ pub struct Watcher {
 
 #[cfg(not(watcher_disable))]
 impl Watcher {
-    #[cfg(test)]
-    pub fn recrawls(&self) -> usize {
-        self.state.recrawls.load(atomic::Ordering::Relaxed)
-    }
-
     pub fn shutdown(&self) {
         self.notify.shutdown();
     }
@@ -144,21 +130,16 @@ impl Watcher {
             .ignore_path_rec(&root, None)
         {
             log::warn!("ignoring root {root:?} as it matches the ignore pattern");
+            root_crawled(false);
             return Ok(());
         }
-        let root = CanonicalPathBuf::assert_canonicalized(&root);
+        self.state.new_roots.lock().unwrap().push(AddRoot {
+            path: CanonicalPathBuf::assert_canonicalized(&root),
+            recursive,
+            notify: Box::new(root_crawled),
+        });
         self.state
-            .notifications
-            .lock()
-            .unwrap()
-            .roots
-            .push(AddRoot {
-                path: root,
-                recursive,
-                notify: Box::new(root_crawled),
-            });
-        self.state
-            .has_notifications
+            .has_new_roots
             .store(true, atomic::Ordering::Relaxed);
         self.notify.changes().notify();
         Ok(())
@@ -187,24 +168,16 @@ impl Watcher {
     }
 
     pub fn new() -> io::Result<Self> {
-        Self::new_impl(false)
-    }
-
-    pub fn new_impl(_slow: bool) -> io::Result<Self> {
         let state = Arc::new(WatcherState {
             config: Mutex::new(Config {
                 filter: Arc::new(()),
                 settle_time: Duration::from_millis(200),
                 handlers: Vec::new(),
             }),
-            notifications: Mutex::new(Notifications::default()),
-            has_notifications: AtomicBool::new(false),
-            #[cfg(test)]
-            recrawls: AtomicUsize::new(0),
+            new_roots: Mutex::new(Vec::new()),
+            has_new_roots: AtomicBool::new(false),
+            started: AtomicBool::new(false),
         });
-        #[cfg(test)]
-        let watcher = NativeBackend::new(_slow, state.clone())?;
-        #[cfg(not(test))]
         let watcher = NativeBackend::new(state.clone())?;
 
         Ok(Self {
@@ -213,7 +186,11 @@ impl Watcher {
         })
     }
 
+    /// Starts the worker thread; later calls do nothing.
     pub fn start(&self) {
+        if self.state.started.swap(true, atomic::Ordering::Relaxed) {
+            return;
+        }
         let watcher = self.clone();
         std::thread::spawn(move || {
             let worker = worker::Worker::new(watcher);

@@ -1,29 +1,8 @@
-use std::hash::BuildHasher;
 use std::mem::{swap, take};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
-use bitflags::bitflags;
-use hashbrown::hash_table::Entry;
-use hashbrown::{DefaultHashBuilder, HashTable};
-
 use crate::path::CanonicalPathBuf;
-
-bitflags! {
-    #[derive(Clone, Copy, Debug)]
-    pub struct Flags: u32 {
-        /// for directories: do a recursive crawl
-        const NEEDS_RECURSIVE_CRAWL = 1;
-        /// for directories: do a non-recursive crawl, some watchers (fsevent)
-        /// only report that *something* changed in a directory but not what,
-        /// it's our job to stat.
-        const NEEDS_NON_RECURSIVE_CRAWL = 2;
-        /// flag set during recursive watch to indicate that nodes should be marked recursive
-        const MARK_RECURSIVE = 4;
-        /// change originated from a watcher
-        const ORIGIN_WATCHER = 8;
-    }
-}
 
 #[derive(Debug, Default)]
 pub struct PendingChangesLock {
@@ -32,72 +11,60 @@ pub struct PendingChangesLock {
 }
 
 impl PendingChangesLock {
-    pub fn take_timeout(
+    /// Waits until there are changes or `exit` returns true, then swaps the
+    /// queue into `dst`. Returns whether `timeout` (if any) elapsed first, in
+    /// which case nothing is taken.
+    pub fn take(
         &self,
         dst: &mut PendingChanges,
-        timeout: Duration,
+        timeout: Option<Duration>,
         exit: impl Fn() -> bool,
     ) -> bool {
         let mut guard = self.inner.lock().unwrap();
-        let res;
-        (guard, res) = self
-            .condvar
-            .wait_timeout_while(guard, timeout, |changes| changes.is_empty() && !exit())
-            .unwrap();
-        if res.timed_out() {
-            return true;
+        let ready = |changes: &mut PendingChanges| !changes.is_empty() || exit();
+        match timeout {
+            None => guard = self.condvar.wait_while(guard, |c| !ready(c)).unwrap(),
+            Some(timeout) => {
+                let (g, res) = self
+                    .condvar
+                    .wait_timeout_while(guard, timeout, |c| !ready(c))
+                    .unwrap();
+                if res.timed_out() {
+                    return true;
+                }
+                guard = g;
+            }
         }
         swap(&mut *guard, dst);
         false
-    }
-
-    pub fn take(&self, dst: &mut PendingChanges, exit: impl Fn() -> bool) {
-        let mut guard = self.inner.lock().unwrap();
-        guard = self
-            .condvar
-            .wait_while(guard, |changes| changes.is_empty() && !exit())
-            .unwrap();
-        swap(&mut *guard, dst);
     }
 
     pub fn lock(&self) -> MutexGuard<'_, PendingChanges> {
         self.inner.lock().unwrap()
     }
 
+    /// Wakes the waiter. It takes the mutex first, so that a waiter that has checked
+    /// its predicate but not started waiting yet doesn't miss the wakeup. Must not
+    /// be called while holding the guard from `lock()`.
     pub fn notify(&self) {
+        drop(self.inner.lock().unwrap());
         self.condvar.notify_all();
     }
 }
 
+/// A path a backend reported as changed.
 #[derive(Clone, Debug)]
 pub struct PendingChange {
     pub path: CanonicalPathBuf,
-    pub flags: Flags,
+    /// Set when the path was created or deleted, or is a directory whose contents
+    /// changed in unknown ways. A directory with this set is crawled.
+    pub crawl: bool,
 }
 
-impl PendingChange {
-    fn consolidate(&mut self, mut new: Flags) {
-        // TODO: is this really  needed
-        new.remove(Flags::ORIGIN_WATCHER);
-        self.flags.insert(new);
-    }
-}
-
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct PendingChanges {
-    path_set: HashTable<u32>,
-    state: DefaultHashBuilder,
     changes: Vec<PendingChange>,
     recrawl: bool,
-}
-
-impl std::fmt::Debug for PendingChanges {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PendingChanges")
-            .field("changes", &self.changes)
-            .field("recrawl", &self.recrawl)
-            .finish()
-    }
 }
 
 impl PendingChanges {
@@ -105,68 +72,76 @@ impl PendingChanges {
         self.changes.is_empty() & !self.recrawl
     }
 
-    // pub fn remove(&mut self, path: impl AsRef<OsStr>) -> bool {
-    //     let path = path.as_ref();
-    //     let hash = self.state.hash_one(path);
-    //     let ent = self
-    //         .path_set
-    //         .find_entry(hash, |&i| self.changes[i as usize].path == path);
-    //     match ent {
-    //         Ok(ent) => {
-    //             ent.remove();
-    //             true
-    //         }
-    //         Err(_) => false,
-    //     }
-    // }
-
     pub fn recrawl(&mut self) {
-        self.path_set.clear();
         self.changes.clear();
         self.recrawl = true;
     }
 
-    fn add(&mut self, change: PendingChange) {
-        if self.recrawl {
-            return;
+    pub fn add(&mut self, path: CanonicalPathBuf, crawl: bool) {
+        if !self.recrawl {
+            self.changes.push(PendingChange { path, crawl });
         }
-        let hash = self.state.hash_one(&change.path);
-        let ent = self.path_set.entry(
-            hash,
-            |&i| self.changes[i as usize].path == change.path,
-            |&i| self.state.hash_one(&self.changes[i as usize].path),
-        );
-        match ent {
-            Entry::Occupied(entry) => {
-                self.changes[*entry.get() as usize].consolidate(change.flags);
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(self.changes.len() as u32);
-                self.changes.push(change);
-            }
-        }
-    }
-
-    pub fn add_watcher(
-        &mut self,
-        path: CanonicalPathBuf,
-        /* timestamp: SystemTime, */ flags: Flags,
-    ) {
-        self.add(PendingChange {
-            path,
-            // timestamp,
-            flags: flags | Flags::ORIGIN_WATCHER,
-        });
     }
 
     pub fn take_recrawl(&mut self) -> bool {
         take(&mut self.recrawl)
     }
 
+    /// The changes in path order, one per path.
     pub fn drain(&mut self) -> impl Iterator<Item = PendingChange> + '_ {
-        self.path_set.clear();
-        self.changes
-            .sort_unstable_by(|change1, change2| change1.path.cmp(&change2.path));
+        self.changes.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+        self.changes.dedup_by(|cur, prev| {
+            let same = cur.path == prev.path;
+            prev.crawl |= same & cur.crawl;
+            same
+        });
         self.changes.drain(..)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    use super::{PendingChanges, PendingChangesLock};
+    use crate::path::CanonicalPathBuf;
+
+    #[test]
+    fn drain_merges_equal_paths() {
+        let path = |p: &str| CanonicalPathBuf::assert_canonicalized(std::path::Path::new(p));
+        let mut pending = PendingChanges::default();
+        pending.add(path("/b"), false);
+        pending.add(path("/a"), false);
+        pending.add(path("/b"), true);
+        pending.add(path("/b"), false);
+        let drained: Vec<_> = pending.drain().map(|c| (c.path, c.crawl)).collect();
+        assert_eq!(drained, [(path("/a"), false), (path("/b"), true)]);
+        assert!(pending.is_empty());
+    }
+
+    /// `notify` must synchronize with the mutex, or it can land between a
+    /// waiter's predicate check and its wait.
+    #[test]
+    fn notify_waits_for_the_mutex() {
+        let lock = Arc::new(PendingChangesLock::default());
+        let done = Arc::new(AtomicBool::new(false));
+        let guard = lock.lock();
+        let handle = {
+            let (lock, done) = (lock.clone(), done.clone());
+            thread::spawn(move || {
+                lock.notify();
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "notify returned while the queue was locked"
+        );
+        drop(guard);
+        handle.join().unwrap();
     }
 }

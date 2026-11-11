@@ -3,17 +3,12 @@
 //! The FSEvents C API and `dispatch` are declared inline (stable system ABIs),
 //! so the crate only needs `core-foundation-sys` for the CF collection/string types.
 //!
-//! Design: one `FSEventStream` over all recursive roots, delivered on a serial
-//! `dispatch` queue (so no CFRunLoop thread is
-//! needed). The stream is created *without* `kFSEventStreamCreateFlagFileEvents`,
-//! so events are directory-granular — exactly what
-//! `pending::Flags::NEEDS_NON_RECURSIVE_CRAWL` was added for: each event enqueues
-//! a re-stat of the reported directory and the worker diffs it against the tree.
-//! `kFSEventStreamEventFlagMustScanSubDirs` (coalescing/overflow) maps to a full
-//! recrawl, mirroring inotify's `QUEUE_OVERFLOW`. The stream is rebuilt when a new
-//! (uncovered) root is added, since FSEvents fixes its path list at creation; the
-//! rebuilt stream resumes from the newest event id seen (`last_event_id`) so the
-//! existing roots' events buffered across the teardown are replayed, not lost.
+//! One `FSEventStream` over all roots, delivered on a serial `dispatch` queue (no
+//! CFRunLoop thread). Without `kFSEventStreamCreateFlagFileEvents` events are
+//! directory-granular: each one queues a crawl of the reported directory.
+//! `MustScanSubDirs` (coalescing/overflow) maps to a full recrawl, like inotify's
+//! `QUEUE_OVERFLOW`. FSEvents fixes the path list at creation, so a new root
+//! rebuilds the stream, resuming from `last_event_id`.
 
 use std::ffi::{c_void, CStr};
 use std::os::unix::ffi::OsStrExt;
@@ -28,7 +23,7 @@ use core_foundation_sys::string::{kCFStringEncodingUTF8, CFStringCreateWithBytes
 
 use crate::backend::Backend;
 use crate::path::CanonicalPathBuf;
-use crate::pending::{self, PendingChangesLock};
+use crate::pending::PendingChangesLock;
 use crate::WatcherState;
 
 // --- FSEvents FFI (CoreServices) ---------------------------------------------
@@ -102,11 +97,9 @@ pub(crate) struct FsEventWatcher {
     queue: *mut c_void, // serial dispatch queue the callback runs on
     pub changes: Arc<PendingChangesLock>,
     state: Arc<WatcherState>,
-    /// Newest FSEvents id seen so far, or 0 before the first stream is built.
-    /// Each rebuild resumes the stream from here instead of `SinceNow`, so events
-    /// buffered for the existing roots during the teardown/recreate window are
-    /// replayed rather than lost -- no full recrawl needed. Updated by the callback
-    /// (serialized on the dispatch queue) and read under `inner`'s lock at rebuild.
+    /// Newest event id seen, 0 before the first stream. A rebuilt stream resumes
+    /// from it, replaying the existing roots' events from the teardown window.
+    /// Written by the callback, read under `inner`'s lock.
     last_event_id: Arc<AtomicU64>,
 }
 
@@ -123,7 +116,7 @@ impl std::fmt::Debug for FsEventWatcher {
 }
 
 impl FsEventWatcher {
-    pub fn new(#[cfg(test)] _slow: bool, state: Arc<WatcherState>) -> io::Result<Arc<Self>> {
+    pub fn new(state: Arc<WatcherState>) -> io::Result<Arc<Self>> {
         let queue = unsafe { dispatch_queue_create(c"filesentry.fsevent".as_ptr(), ptr::null()) };
         if queue.is_null() {
             return Err(io::Error::other("dispatch_queue_create failed"));
@@ -156,11 +149,8 @@ impl FsEventWatcher {
                 return Ok(());
             }
             let paths = cf_paths(&inner.roots);
-            // Resume from the newest id seen so far rather than `SinceNow`, so events
-            // buffered for the existing roots while the stream is torn down and
-            // recreated are replayed instead of dropped. The first build has no id
-            // yet; anchor it on the current system id so the *next* rebuild has a
-            // concrete point to resume from even if no event arrived in between.
+            // The first build anchors on the current system id, so the next rebuild
+            // has one to resume from even if no event arrived in between.
             let mut since_when = self.last_event_id.load(atomic::Ordering::Relaxed);
             if since_when == 0 {
                 since_when = FSEventsGetCurrentEventId();
@@ -235,11 +225,6 @@ impl crate::backend::Backend for FsEventWatcher {
             return Ok(());
         }
         inner.roots.push(path);
-        // Rebuilding tears down the existing stream (FSEvents fixes its path list at
-        // creation). The replacement resumes from `last_event_id` (see
-        // `rebuild_stream`), so events buffered for the existing roots during the
-        // teardown/recreate window are replayed -- no recrawl needed to resync them.
-        // The new root's own initial state is crawled separately by the worker.
         self.rebuild_stream(&mut inner)?;
         Ok(())
     }
@@ -410,12 +395,8 @@ fn process_events<'a>(
             changes.recrawl();
             break;
         }
-        // FSEvents reports directory paths with a trailing `/`, but
-        // `CanonicalPathBuf` requires paths to never end in a separator: a
-        // trailing slash makes `foo/bar/` hash and compare distinct from the
-        // crawl-built `foo/bar`, spawning a duplicate tree node that a later
-        // crawl then reports as spuriously deleted. Strip it so the path matches
-        // the canonical node.
+        // FSEvents reports directories with a trailing `/`, which would not match
+        // the tree's `foo/bar`.
         let path = strip_trailing_sep(path);
         let path = CanonicalPathBuf::assert_canonicalized(path);
         // `ignore_path_rec`, not `ignore_path`: FSEvents has no per-directory
@@ -425,7 +406,7 @@ fn process_events<'a>(
         if filter.ignore_path_rec(path.as_std_path(), Some(true)) {
             continue;
         }
-        changes.add_watcher(path, pending::Flags::NEEDS_NON_RECURSIVE_CRAWL);
+        changes.add(path, true);
     }
     drop(changes);
     info.changes.notify();
@@ -442,7 +423,7 @@ mod tests {
     /// events rather than `.unwrap()` and abort across the `extern "C"` frame.
     #[test]
     fn callback_tolerates_poisoned_config() {
-        let watcher = Watcher::new_impl(false).unwrap();
+        let watcher = Watcher::new().unwrap();
         let info = CallbackInfo {
             state: watcher.state.clone(),
             changes: watcher.notify.changes.clone(),
@@ -469,13 +450,10 @@ mod tests {
         );
     }
 
-    /// FSEvents hands directory paths to the callback with a trailing `/`. The
-    /// recorded change must drop it so it matches the crawl-built canonical node
-    /// (`foo/bar`, not `foo/bar/`); otherwise a duplicate tree node is created and
-    /// later reported as a spurious delete.
+    /// The trailing `/` of FSEvents' directory paths must be stripped.
     #[test]
     fn callback_strips_trailing_slash() {
-        let watcher = Watcher::new_impl(false).unwrap();
+        let watcher = Watcher::new().unwrap();
         let info = CallbackInfo {
             state: watcher.state.clone(),
             changes: watcher.notify.changes.clone(),
@@ -500,7 +478,7 @@ mod tests {
     /// dropped. The default `()` filter ignores a `.git` component.
     #[test]
     fn callback_drops_events_under_ignored_ancestor() {
-        let watcher = Watcher::new_impl(false).unwrap();
+        let watcher = Watcher::new().unwrap();
         let info = CallbackInfo {
             state: watcher.state.clone(),
             changes: watcher.notify.changes.clone(),
@@ -528,17 +506,14 @@ mod tests {
         );
     }
 
-    /// Adding a second root rebuilds the single FSEvents stream, tearing the old one
-    /// down. The replacement resumes from `last_event_id` (anchored on the current
-    /// system id at the first build), so events for the already-watched roots are
-    /// replayed rather than lost -- no recrawl is forced, unlike the old `SinceNow`
-    /// rebuild which had to recrawl to recover them.
+    /// A second root rebuilds the stream, which resumes from `last_event_id`
+    /// instead of forcing a recrawl.
     #[test]
     fn adding_a_root_resumes_without_recrawl() {
         use crate::backend::Backend;
         use std::sync::atomic::Ordering;
 
-        let watcher = Watcher::new_impl(false).unwrap();
+        let watcher = Watcher::new().unwrap();
         let fs = &watcher.notify;
         let d1 = tempfile::tempdir().unwrap();
         let d2 = tempfile::tempdir().unwrap();

@@ -11,31 +11,20 @@ use papaya::HashMap;
 use crate::backend::Backend;
 use crate::inotify::sys::{Event, EventFlags, Inotify, Watch};
 use crate::path::CanonicalPathBuf;
-use crate::pending::{self, PendingChangesLock};
+use crate::pending::PendingChangesLock;
 use crate::{Filter, WatcherState};
 
+#[derive(Debug)]
 pub(crate) struct InotifyWatcher {
-    waker: mio::Waker,
+    waker: Waker,
     shutdown: AtomicBool,
     notify: Inotify,
     watches: HashMap<Watch, CanonicalPathBuf, DefaultHashBuilder>,
-    pub changes: PendingChangesLock,
-}
-
-impl std::fmt::Debug for InotifyWatcher {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InotifyWatcher")
-            .field("waker", &self.waker)
-            .field("shutdown", &self.shutdown)
-            .field("notify", &self.notify)
-            .field("watches", &self.watches)
-            .field("changes", &self.changes)
-            .finish_non_exhaustive()
-    }
+    changes: PendingChangesLock,
 }
 
 impl InotifyWatcher {
-    pub fn new(#[cfg(test)] slow: bool, state: Arc<WatcherState>) -> io::Result<Arc<Self>> {
+    pub fn new(state: Arc<WatcherState>) -> io::Result<Arc<Self>> {
         let mut poll = Poll::new()?;
         let waker = Waker::new(poll.registry(), sys::MESSAGE)?;
         let watcher = Arc::new(Self {
@@ -52,31 +41,25 @@ impl InotifyWatcher {
             watcher_.notify.event_loop(
                 &mut poll,
                 &mut filter,
-                |filter, event /* , timestamp */| {
-                    watcher_.handle_event(event, &**filter /* , timestamp */)
-                },
-                |_| {
-                    watcher_.changes.notify();
-                },
+                |filter, event| watcher_.handle_event(event, &**filter),
+                |_| watcher_.changes.notify(),
                 |filter| {
                     *filter = state.config.lock().unwrap().filter.clone();
                     watcher_.is_shutdown()
                 },
-                #[cfg(test)]
-                slow,
             )
         });
         Ok(watcher)
     }
 
     fn handle_event(&self, event: Event, filter: &dyn Filter) {
-        // need to recrawl everything anyway if the queue overflowed
         if event.flags.contains(EventFlags::QUEUE_OVERFLOW) {
             self.changes.lock().recrawl();
             return;
         }
         let watches = self.watches.pin();
         let Some(dir) = watches.get(&event.wd) else {
+            // lost track of a watch: resync everything
             if event.wd.is_invalid()
                 || event
                     .flags
@@ -86,47 +69,35 @@ impl InotifyWatcher {
             }
             return;
         };
-
-        let watch_deleted = event.flags.intersects(
-            EventFlags::IGNORED
-                | EventFlags::MOVE_SELF
-                | EventFlags::DELETE_SELF
-                | EventFlags::UNMOUNT,
-        );
-        if event.child.is_empty() || watch_deleted {
+        let about_dir = EventFlags::IGNORED
+            | EventFlags::MOVE_SELF
+            | EventFlags::DELETE_SELF
+            | EventFlags::UNMOUNT;
+        if event.child.is_empty() || event.flags.intersects(about_dir) {
             if event.flags.contains(EventFlags::IGNORED) {
                 watches.remove(&event.wd);
+            } else if event.flags.contains(EventFlags::MOVE_SELF) {
+                // A moved directory keeps its watch, which would go on reporting
+                // under the old path. Remove it; the kernel's IGNORED for it then
+                // drops the mapping above (forgetting it here instead would turn
+                // that IGNORED into an unknown-watch recrawl).
+                let _ = self.notify.remove_watch(&event.wd);
             }
-            let path = dir.clone();
-            self.changes.lock().add_watcher(
-                path,
-                /* timestamp, */ pending::Flags::NEEDS_RECURSIVE_CRAWL,
-            );
-        } else {
-            let path = dir.join(event.child);
-            if filter.ignore_path(
-                path.as_std_path(),
-                Some(event.flags.contains(EventFlags::ISDIR)),
-            ) {
-                return;
-            }
-            let mut pending = self.changes.lock();
-            if event
+            self.changes.lock().add(dir.clone(), true);
+            return;
+        }
+        let path = dir.join(event.child);
+        let is_dir = event.flags.contains(EventFlags::ISDIR);
+        if !filter.ignore_path(path.as_std_path(), Some(is_dir)) {
+            let crawl = event
                 .flags
-                .intersects(EventFlags::CREATE | EventFlags::DELETE)
-            {
-                pending.add_watcher(
-                    path,
-                    /* timestamp, */ pending::Flags::NEEDS_RECURSIVE_CRAWL,
-                );
-            } else {
-                pending.add_watcher(path, /* timestamp, */ pending::Flags::empty());
-            }
+                .intersects(EventFlags::CREATE | EventFlags::DELETE);
+            self.changes.lock().add(path, crawl);
         }
     }
 }
 
-impl crate::backend::Backend for InotifyWatcher {
+impl Backend for InotifyWatcher {
     fn changes(&self) -> &PendingChangesLock {
         &self.changes
     }
