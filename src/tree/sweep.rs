@@ -380,14 +380,13 @@ fn sweep_one(seed: u64) {
     } else {
         Backend::Precise
     };
-    // 0: one recursive root; 1: an inner root, the enclosing one added later;
-    // 2: a nested root inside an ignored directory, added later;
-    // 3: one non-recursive root.
-    let scenario = rng.pick(4);
+    // 0: one root; 1: an inner root, the enclosing one added later (the inner
+    // root in `d1` is cut off from it whenever `d1` is ignored).
+    let scenario = rng.pick(2);
     let (initial, late, mut protected) = match scenario {
         0 => (vec![root.clone()], None, vec![]),
         _ => {
-            let inner = root.join("d0");
+            let inner = root.join(["d0", "d1/n"][rng.pick(2)]);
             (vec![inner.clone()], Some(root.clone()), vec![inner])
         }
     };
@@ -441,8 +440,9 @@ fn sweep_one(seed: u64) {
             if let Some(late) = &late {
                 roots.push(late.clone());
                 h.add_root(late, &mut debouncer);
-                // an inner root is now just a subdirectory of the enclosing one
-                if scenario == 1 {
+                // an inner root the enclosing one always reaches is now just one of
+                // its subdirectories
+                if roots[0].ends_with("d0") {
                     roots.remove(0);
                     protected.clear();
                 }

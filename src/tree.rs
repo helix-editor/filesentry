@@ -106,7 +106,7 @@ pub struct FileTree {
     by_path: HashMap<CanonicalPathBuf, NodeId>,
     nodes: Vec<FsNode>,
     dirs: Vec<EcoVec<NodeId>>,
-    /// The roots to crawl on a full resync: those no other recursive root covers.
+    /// Every root added, in tree order, for a full resync.
     roots: Vec<NodeId>,
 }
 
@@ -158,38 +158,9 @@ impl FileTree {
         }
     }
 
-    /// Starts tracking the directory `path`, or returns `None` if it already is.
-    /// The caller then crawls the returned root.
-    pub fn add_root(&mut self, path: CanonicalPathBuf, recursive: bool) -> Option<NodeId> {
-        let watch = if recursive {
-            Flags::RECURSIVE
-        } else {
-            Flags::WATCH_CHILDREN
-        };
-        if let Some(id) = self.find(path.as_os_str()) {
-            if self[id].meta == NodeMeta::Deleted {
-                // The directory was deleted and recreated, and its own event hasn't
-                // arrived yet. The node is stale, so track it again.
-                let meta = Metadata::for_path(&path)?;
-                self.update(id, Some(&meta), false, &mut |_, _| {});
-                self[id].flags |= watch | Flags::ROOT;
-                return Some(id);
-            }
-            let node = &mut self[id];
-            if !node.meta.is_dir() || node.flags.contains(watch) {
-                return None;
-            }
-            node.flags |= watch | Flags::ROOT;
-            return Some(id);
-        }
-        let meta = Metadata::for_path(&path)?;
-        let parent = path.parent().and_then(|p| self.find(p.as_os_str()));
-        let id = self.insert(path, parent, watch | Flags::ROOT);
-        self.update(id, Some(&meta), false, &mut |_, _| {});
-        Some(id)
-    }
-
-    /// Starts tracking `path` and crawls it, unless it already is tracked.
+    /// Starts tracking the directory `path` as a root and crawls it, unless the
+    /// tree already tracks it like that. Returns the root, or `None` if `path` is
+    /// not a directory.
     pub fn track_root(
         &mut self,
         path: CanonicalPathBuf,
@@ -197,35 +168,57 @@ impl FileTree {
         filter: &dyn Filter,
         emit: impl FnMut(CanonicalPathBuf, EventType),
         add_watch: impl FnMut(CanonicalPathBuf),
-    ) {
-        let Some(node) = self.add_root(path.clone(), recursive) else {
-            return;
+    ) -> Option<NodeId> {
+        let watch = if recursive {
+            Flags::RECURSIVE
+        } else {
+            Flags::WATCH_CHILDREN
         };
-        self.crawl(node, true, filter, emit, add_watch);
-        if recursive {
-            // the new root's crawl covers the roots inside it, unless they are in an
-            // ignored directory
-            let nodes = &self.nodes;
-            self.roots.retain(|&r| {
-                let inner = &nodes[r.idx()].path;
-                !path.is_parent_of(inner) || filter.ignore_path_rec(inner.as_std_path(), Some(true))
-            });
+        let (id, new) = match self.find(path.as_os_str()) {
+            Some(id) if self[id].meta != NodeMeta::Deleted => (id, false),
+            // A deleted node may be stale: its directory was recreated, and the
+            // event saying so hasn't arrived yet.
+            found => {
+                let meta = Metadata::for_path(&path).filter(|meta| meta.is_dir)?;
+                let id = found.unwrap_or_else(|| {
+                    let parent = path.parent().and_then(|p| self.find(p.as_os_str()));
+                    self.insert(path.clone(), parent, Flags::empty())
+                });
+                self.update(id, Some(&meta), false, &mut |_, _| {});
+                (id, true)
+            }
+        };
+        if !self[id].meta.is_dir() {
+            return None;
         }
-        if !self.roots.contains(&node) {
-            self.roots.push(node);
+        // A directory already tracked through an enclosing root becomes a root as
+        // well, so it stays tracked if a filter change makes that root skip it.
+        let crawl = new || !self[id].flags.contains(watch);
+        self[id].flags |= watch | Flags::ROOT;
+        if crawl {
+            self.crawl(id, true, filter, emit, add_watch);
         }
+        if let Err(i) = self.roots.binary_search_by(|&r| self[r].path.cmp(&path)) {
+            self.roots.insert(i, id);
+        }
+        Some(id)
     }
 
-    /// Re-syncs every root with the disk, for when the backend lost track of
-    /// what changed.
+    /// Re-syncs every root with the disk, for when the backend lost track of what
+    /// changed. Enclosing roots are crawled first, and the roots their crawls reach
+    /// are skipped.
     pub fn recrawl(
         &mut self,
         filter: &dyn Filter,
         mut emit: impl FnMut(CanonicalPathBuf, EventType),
         mut add_watch: impl FnMut(CanonicalPathBuf),
     ) {
+        let mut covered = Vec::new();
         for i in 0..self.roots.len() {
-            self.crawl_impl(self.roots[i], false, filter, &mut emit, &mut add_watch);
+            let root = self.roots[i];
+            if !covered.contains(&root) {
+                covered.extend(self.crawl_impl(root, false, filter, &mut emit, &mut add_watch));
+            }
         }
     }
 
@@ -348,11 +341,18 @@ impl FileTree {
         meta.is_dir && (inode_changed || !was_dir)
     }
 
-    /// Marks `id` and everything below it deleted, emitting a `Delete` per file.
+    /// Marks `id` and everything below it deleted, emitting a `Delete` per file. A
+    /// root that is still a directory on disk is kept, because it is tracked whether
+    /// or not an enclosing root covers it.
     fn delete(&mut self, id: NodeId, emit: Emit) {
         let mut stack = vec![id];
         while let Some(id) = stack.pop() {
             let node = &mut self.nodes[id.idx()];
+            if node.flags.contains(Flags::ROOT)
+                && Metadata::for_path(&node.path).is_some_and(|meta| meta.is_dir)
+            {
+                continue;
+            }
             match replace(&mut node.meta, NodeMeta::Deleted) {
                 NodeMeta::File { .. } => emit(node.path.clone(), EventType::Delete),
                 NodeMeta::Dir if node.children != DirId::NONE => {
@@ -375,9 +375,10 @@ impl FileTree {
         mut emit: impl FnMut(CanonicalPathBuf, EventType),
         mut add_watch: impl FnMut(CanonicalPathBuf),
     ) {
-        self.crawl_impl(root, initial, filter, &mut emit, &mut add_watch)
+        self.crawl_impl(root, initial, filter, &mut emit, &mut add_watch);
     }
 
+    /// Returns the other roots the crawl walked into.
     fn crawl_impl(
         &mut self,
         root: NodeId,
@@ -385,7 +386,7 @@ impl FileTree {
         filter: &dyn Filter,
         emit: Emit,
         add_watch: &mut dyn FnMut(CanonicalPathBuf),
-    ) {
+    ) -> Vec<NodeId> {
         let recursive = self[root].flags.contains(Flags::RECURSIVE);
         let mut walk = WalkDir::new(self[root].path.as_std_path())
             .min_depth(1)
@@ -399,6 +400,7 @@ impl FileTree {
         // the directories the walk is in, with their depth and whether their
         // new entries are silenced
         let mut open = vec![(root, 0, initial)];
+        let mut reached = Vec::new();
         self.mark_children(root, true);
         let mut walk = walk.into_iter();
         while let Some(entry) = walk.next() {
@@ -460,6 +462,9 @@ impl FileTree {
             // Only descend into directories pushed on `open`, so that its top stays
             // the parent of the next entry.
             if recursive && self[id].meta.is_dir() {
+                if self[id].flags.contains(Flags::ROOT) {
+                    reached.push(id);
+                }
                 add_watch(path);
                 self.mark_children(id, true);
                 open.push((id, entry.depth(), quiet && !watched));
@@ -470,6 +475,7 @@ impl FileTree {
         while let Some((dir, _, _)) = open.pop() {
             self.sweep_children(dir, emit);
         }
+        reached
     }
 
     fn mark_children(&mut self, dir: NodeId, maybe_deleted: bool) {
@@ -537,8 +543,9 @@ mod tests {
 
     fn watch(root: &Path, recursive: bool) -> (FileTree, NodeId) {
         let mut tree = FileTree::new();
-        let id = tree.add_root(canon(root), recursive).unwrap();
-        tree.crawl(id, true, &(), |_, _| {}, |_| {});
+        let id = tree
+            .track_root(canon(root), recursive, &(), |_, _| {}, |_| {})
+            .unwrap();
         (tree, id)
     }
 
@@ -566,7 +573,7 @@ mod tests {
     /// A directory that was deleted and recreated stays a stale node until its own
     /// event arrives. Adding it as a root must still track it.
     #[test]
-    fn add_root_on_recreated_dir() {
+    fn recreated_dir_as_root() {
         let (_dir, root) = tempdir();
         let d = root.join("d");
         fs::create_dir(&d).unwrap();
@@ -574,7 +581,9 @@ mod tests {
         fs::remove_dir(&d).unwrap();
         crawl(&mut tree, id, &());
         fs::create_dir(&d).unwrap();
-        let inner = tree.add_root(canon(&d), true).expect("root not added");
+        let inner = tree
+            .track_root(canon(&d), true, &(), |_, _| {}, |_| {})
+            .expect("root not added");
         fs::write(d.join("f"), b"x").unwrap();
         let events = crawl(&mut tree, inner, &());
         assert!(has(&events, EventType::Create, &d.join("f")), "{events:?}");
@@ -631,9 +640,14 @@ mod tests {
         let (mut tree, _) = watch(&inner, true);
         let file = inner.join("new");
         fs::write(&file, b"x").unwrap();
-        let id = tree.add_root(canon(&outer), true).unwrap();
         let mut events = Vec::new();
-        tree.crawl(id, true, &(), |p, ty| events.push((p, ty)), |_| {});
+        tree.track_root(
+            canon(&outer),
+            true,
+            &(),
+            |p, ty| events.push((p, ty)),
+            |_| {},
+        );
         assert_eq!(events, [(canon(&file), EventType::Create)]);
     }
 
@@ -656,6 +670,44 @@ mod tests {
         fs::set_permissions(&sub, fs::Permissions::from_mode(0o700)).unwrap();
         if unreadable {
             assert_eq!(events, Events::new());
+        }
+    }
+
+    /// A root inside another stays tracked, in whichever order they were added,
+    /// when a filter change makes the enclosing root skip the directory between
+    /// them.
+    #[test]
+    fn covered_root_survives_filter_change() {
+        struct IgnoreMid;
+        impl Filter for IgnoreMid {
+            fn ignore_path(&self, path: &Path, _: Option<bool>) -> bool {
+                path.file_name().is_some_and(|n| n == "mid")
+            }
+        }
+        for inner_first in [true, false] {
+            let (_dir, outer) = tempdir();
+            let inner = outer.join("mid/inner");
+            fs::create_dir_all(&inner).unwrap();
+            fs::write(inner.join("old"), b"x").unwrap();
+            let mut tree = FileTree::new();
+            let mut roots = [&inner, &outer];
+            if !inner_first {
+                roots.reverse();
+            }
+            for root in roots {
+                tree.track_root(canon(root), true, &(), |_, _| {}, |_| {});
+            }
+            // the enclosing root's crawl covers the inner one
+            let mut watched = Vec::new();
+            tree.recrawl(&(), |_, _| {}, |p| watched.push(p));
+            assert_eq!(watched.iter().filter(|p| **p == inner).count(), 1);
+            let mut events = Vec::new();
+            tree.recrawl(&IgnoreMid, |p, ty| events.push((p, ty)), |_| {});
+            assert_eq!(events, Events::new());
+            let file = inner.join("new");
+            fs::write(&file, b"x").unwrap();
+            let events = apply(&mut tree, &IgnoreMid, &[(&file, true)]);
+            assert_eq!(events, [(canon(&file), EventType::Create)]);
         }
     }
 }
