@@ -363,9 +363,10 @@ impl FileTree {
         }
     }
 
-    /// Re-syncs the contents of `root` (its whole subtree if it is recursive)
-    /// with the disk. `initial` silences the `Create`s for paths the tree has
-    /// never seen: a new root's contents aren't news.
+    /// Re-syncs the contents of `root` (its whole subtree if it is recursive) with
+    /// the disk. `initial` silences the `Create`s for new paths in directories the
+    /// tree wasn't watching yet. A new root's contents aren't news, but changes
+    /// inside an earlier root it encloses are.
     pub fn crawl(
         &mut self,
         root: NodeId,
@@ -395,8 +396,9 @@ impl FileTree {
             walk = walk.max_depth(1);
         }
         add_watch(self[root].path.clone());
-        // the directories the walk is in, with their depth
-        let mut open = vec![(root, 0)];
+        // the directories the walk is in, with their depth and whether their
+        // new entries are silenced
+        let mut open = vec![(root, 0, initial)];
         self.mark_children(root);
         let mut walk = walk.into_iter();
         while let Some(entry) = walk.next() {
@@ -406,9 +408,9 @@ impl FileTree {
             };
             while open
                 .last()
-                .is_some_and(|&(_, depth)| depth >= entry.depth())
+                .is_some_and(|&(_, depth, _)| depth >= entry.depth())
             {
-                let (dir, _) = open.pop().unwrap();
+                let (dir, _, _) = open.pop().unwrap();
                 self.sweep_children(dir, emit);
             }
             let is_dir = entry.file_type().is_dir();
@@ -418,7 +420,7 @@ impl FileTree {
                 }
                 continue;
             }
-            let parent = open.last().unwrap().0;
+            let (parent, _, quiet) = *open.last().unwrap();
             let path = CanonicalPathBuf::assert_canonicalized(entry.path());
             let meta = Metadata::for_path(&path);
             let id = match self.find(path.as_os_str()) {
@@ -435,11 +437,12 @@ impl FileTree {
                 None if meta.is_none() => continue,
                 None => {
                     let id = self.insert(path.clone(), Some(parent), Flags::empty());
-                    let sink: Emit = if initial { &mut |_, _| {} } else { &mut *emit };
+                    let sink: Emit = if quiet { &mut |_, _| {} } else { &mut *emit };
                     self.update(id, meta.as_ref(), false, sink);
                     id
                 }
             };
+            let watched = self[id].flags.contains(Flags::WATCH_CHILDREN);
             if recursive {
                 self[id].flags |= Flags::RECURSIVE;
             }
@@ -448,12 +451,12 @@ impl FileTree {
             if recursive && self[id].meta.is_dir() {
                 add_watch(path);
                 self.mark_children(id);
-                open.push((id, entry.depth()));
+                open.push((id, entry.depth(), quiet && !watched));
             } else if is_dir {
                 walk.skip_current_dir();
             }
         }
-        while let Some((dir, _)) = open.pop() {
+        while let Some((dir, _, _)) = open.pop() {
             self.sweep_children(dir, emit);
         }
     }
@@ -603,6 +606,24 @@ mod tests {
             let events = apply(&mut tree, &(), &[(&root, true), (&file, file_crawl)]);
             assert!(has(&events, EventType::Modified, &file), "{events:?}");
         }
+    }
+
+    /// The initial crawl of a root added around an earlier one only silences new
+    /// paths in directories the tree didn't watch yet. A file created in the inner
+    /// root before that crawl is still a `Create`.
+    #[test]
+    fn initial_crawl_keeps_inner_creates() {
+        let (_dir, outer) = tempdir();
+        let inner = outer.join("inner");
+        fs::create_dir(&inner).unwrap();
+        fs::write(outer.join("old"), b"x").unwrap();
+        let (mut tree, _) = watch(&inner, true);
+        let file = inner.join("new");
+        fs::write(&file, b"x").unwrap();
+        let id = tree.add_root(canon(&outer), true).unwrap();
+        let mut events = Vec::new();
+        tree.crawl(id, true, &(), |p, ty| events.push((p, ty)), |_| {});
+        assert_eq!(events, [(canon(&file), EventType::Create)]);
     }
 }
 
