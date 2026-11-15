@@ -59,9 +59,9 @@ impl Metadata {
 
         let wide = path.to_wide();
         let mut data: WIN32_FILE_ATTRIBUTE_DATA = unsafe { std::mem::zeroed() };
-        // A single attribute query, the analogue of unix `lstat`: it does not open a
-        // handle and does not follow reparse points. Returns 0 (e.g. FILE_NOT_FOUND)
-        // when the path is gone, which we map to `None` like `ENOENT`/`ENOTDIR`.
+        // A single attribute query, like unix `lstat`, which doesn't open a handle
+        // or follow reparse points. It returns 0 (e.g. FILE_NOT_FOUND) when the path
+        // is gone, which maps to `None` like `ENOENT`/`ENOTDIR`.
         let ok = unsafe {
             GetFileAttributesExW(
                 wide.as_ptr(),

@@ -2,9 +2,8 @@ fn main() {
     // Declare the custom cfg for check-cfg
     println!("cargo::rustc-check-cfg=cfg(watcher_disable)");
 
-    // Gate on the *target* OS (CARGO_CFG_TARGET_OS, not the host — correct under
-    // cross-compilation): inotify (linux), FSEvents (macos), ReadDirectoryChangesW
-    // (windows).
+    // Gate on the target OS (CARGO_CFG_TARGET_OS) rather than the host, so that
+    // cross-compiling picks the right backend.
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let supported = matches!(target_os.as_str(), "linux" | "macos" | "windows");
 

@@ -303,9 +303,9 @@ unsafe fn cf_path_array(path: &CanonicalPathBuf) -> CFArrayRef {
         kCFAllocatorDefault,
         items.as_ptr(),
         1,
-        &kCFTypeArrayCallBacks, // the array retains the string…
+        &kCFTypeArrayCallBacks, // the array retains the string
     );
-    CFRelease(s as *const c_void); // …so we drop our reference
+    CFRelease(s as *const c_void); // so we can drop our reference
     array
 }
 
@@ -416,8 +416,8 @@ mod tests {
     use crate::Watcher;
     use std::path::Path;
 
-    /// A panicking handler poisons the config mutex; the callback must still record
-    /// events rather than `.unwrap()` and abort across the `extern "C"` frame.
+    /// A panicking handler poisons the config mutex. The callback must still record
+    /// events rather than unwrap the lock and abort across the `extern "C"` frame.
     #[test]
     fn callback_tolerates_poisoned_config() {
         let watcher = Watcher::new().unwrap();
@@ -479,7 +479,7 @@ mod tests {
             changes: watcher.notify.changes.clone(),
         };
 
-        // A directory *inside* an ignored `.git` -- the leaf itself is not `.git`.
+        // A directory inside an ignored `.git` that isn't called `.git` itself.
         process_events(
             &info,
             std::iter::once((Path::new("/tmp/filesentry-test/.git/objects"), 0u32)),

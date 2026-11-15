@@ -129,12 +129,11 @@ impl Ord for CanonicalPathBuf {
     }
 }
 
-/// Total order over canonical paths that also yields "tree order": a directory
-/// sorts immediately before its descendants, and a path's descendants sort
-/// before siblings that share its prefix. Ranking the path separator below every
-/// other byte (and end-of-path below the separator, so a parent sorts first)
-/// makes this a plain lexicographic compare over an injective rank — a provable
-/// total order, unlike the hand-rolled comparator it replaced.
+/// Total order over canonical paths that also yields tree order, where a directory
+/// sorts immediately before its descendants and a path's descendants sort before
+/// siblings that share its prefix. Ranking the path separator below every other
+/// byte, and the end of a path below the separator, makes this a plain lexicographic
+/// comparison over an injective rank.
 fn cmp(lhs: &[u8], rhs: &[u8]) -> Ordering {
     let lhs = strip_nul(lhs);
     let rhs = strip_nul(rhs);

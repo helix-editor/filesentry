@@ -66,7 +66,7 @@ mod tests {
     }
 
     #[test]
-    fn ignore_path_rec_treats_ancestors_as_dirs() {
+    fn ancestors_count_as_dirs() {
         let f = DirOnlyTarget;
         // The leaf is a file, but its ancestor `target` is a directory and must be
         // recognized as ignored even though the leaf is passed as `Some(false)`.
