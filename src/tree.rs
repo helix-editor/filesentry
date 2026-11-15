@@ -242,11 +242,14 @@ impl FileTree {
             if self.apply_change(&change, filter, &mut emit, &mut add_watch) {
                 while let Some(next) = changes.next_if(|next| change.path.is_parent_of(&next.path))
                 {
-                    // Crawls compare metadata; a precise notification still matters when
-                    // the bytes changed without a new size, inode or timestamp.
-                    if !next.crawl {
-                        self.apply_change(&next, filter, &mut emit, &mut add_watch);
-                    }
+                    // The crawl already covered `next`, but its notification still
+                    // applies, because a crawl only compares metadata and the file
+                    // may have changed without a new size, inode or mtime.
+                    let next = PendingChange {
+                        crawl: false,
+                        ..next
+                    };
+                    self.apply_change(&next, filter, &mut emit, &mut add_watch);
                 }
             }
         }
@@ -578,45 +581,30 @@ mod tests {
         let events = apply(&mut tree, &(), &[(&x, false), (&d, false)]);
         assert!(has(&events, EventType::Create, &d.join("f")), "{events:?}");
     }
+
+    /// A crawl only compares metadata, so the crawl of an ancestor must not drop the
+    /// notification for a file rewritten with the same size and mtime, whether or
+    /// not the notification also asked for a crawl.
+    #[test]
+    fn crawl_keeps_precise_notification() {
+        for file_crawl in [false, true] {
+            let (_dir, root) = tempdir();
+            let file = root.join("f");
+            fs::write(&file, b"old").unwrap();
+            let mtime = fs::metadata(&file).unwrap().modified().unwrap();
+            let (mut tree, _) = watch(&root, true);
+            fs::write(&file, b"new").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+            let events = apply(&mut tree, &(), &[(&root, true), (&file, file_crawl)]);
+            assert!(has(&events, EventType::Modified, &file), "{events:?}");
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
 mod sweep;
-
-#[cfg(test)]
-mod precise_notifications {
-    use super::*;
-    use std::fs;
-
-    #[test]
-    fn ancestor_crawl_must_not_erase_precise_file_notification() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let file = root.join("f");
-        fs::write(&file, b"old").unwrap();
-        let mtime = fs::metadata(&file).unwrap().modified().unwrap();
-        let mut tree = FileTree::new();
-        let root_id = tree
-            .add_root(CanonicalPathBuf::assert_canonicalized(&root), true)
-            .unwrap();
-        tree.crawl(root_id, true, &(), |_, _| {}, |_| {});
-        fs::write(&file, b"new").unwrap();
-        fs::File::options()
-            .write(true)
-            .open(&file)
-            .unwrap()
-            .set_modified(mtime)
-            .unwrap();
-        let mut changes = PendingChanges::default();
-        changes.add(CanonicalPathBuf::assert_canonicalized(&root), true);
-        changes.add(CanonicalPathBuf::assert_canonicalized(&file), false);
-        let mut events = Vec::new();
-        tree.apply_transaction(&mut changes, &(), |p, t| events.push((p, t)), |_| {});
-        assert!(
-            events
-                .iter()
-                .any(|(p, t)| *p == file && *t == EventType::Modified),
-            "{events:?}"
-        );
-    }
-}
