@@ -399,12 +399,23 @@ impl FileTree {
         // the directories the walk is in, with their depth and whether their
         // new entries are silenced
         let mut open = vec![(root, 0, initial)];
-        self.mark_children(root);
+        self.mark_children(root, true);
         let mut walk = walk.into_iter();
         while let Some(entry) = walk.next() {
-            // TODO: unreadable entries are skipped silently
-            let Ok(entry) = entry else {
-                continue;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    log::warn!("failed to crawl: {err}");
+                    let dir = err.path().and_then(|path| {
+                        open.iter()
+                            .rev()
+                            .find(|&&(dir, ..)| path.starts_with(self[dir].path.as_std_path()))
+                    });
+                    if let Some(&(dir, ..)) = dir {
+                        self.mark_children(dir, false);
+                    }
+                    continue;
+                }
             };
             while open
                 .last()
@@ -450,7 +461,7 @@ impl FileTree {
             // the parent of the next entry.
             if recursive && self[id].meta.is_dir() {
                 add_watch(path);
-                self.mark_children(id);
+                self.mark_children(id, true);
                 open.push((id, entry.depth(), quiet && !watched));
             } else if is_dir {
                 walk.skip_current_dir();
@@ -461,9 +472,9 @@ impl FileTree {
         }
     }
 
-    fn mark_children(&mut self, dir: NodeId) {
+    fn mark_children(&mut self, dir: NodeId, maybe_deleted: bool) {
         for &child in &self.children(dir) {
-            self[child].flags |= Flags::MAYBE_DELETED;
+            self[child].flags.set(Flags::MAYBE_DELETED, maybe_deleted);
         }
     }
 
@@ -624,6 +635,28 @@ mod tests {
         let mut events = Vec::new();
         tree.crawl(id, true, &(), |p, ty| events.push((p, ty)), |_| {});
         assert_eq!(events, [(canon(&file), EventType::Create)]);
+    }
+
+    /// A directory the crawl can't read isn't empty, so its files shouldn't be
+    /// reported as deleted.
+    #[test]
+    #[cfg(unix)]
+    fn unreadable_dir_keeps_its_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, root) = tempdir();
+        let sub = root.join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("f"), b"x").unwrap();
+        let (mut tree, id) = watch(&root, true);
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o000)).unwrap();
+        // the superuser can read it anyway
+        let unreadable = fs::read_dir(&sub).is_err();
+        let events = crawl(&mut tree, id, &());
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o700)).unwrap();
+        if unreadable {
+            assert_eq!(events, Events::new());
+        }
     }
 }
 
